@@ -14,7 +14,7 @@ import io
 from typing import Optional
 import sys
 
-from config import PDF_CACHE_DIR, REQUEST_TIMEOUT, PDF_DOWNLOAD_TIMEOUT, MAX_RETRIES
+from config import PDF_CACHE_DIR, REQUEST_TIMEOUT, PDF_DOWNLOAD_TIMEOUT, MAX_RETRIES, USE_DOCUMENT_AI
 from utils import (is_pdf_url, sanitize_filename, normalize_text, 
                    is_google_drive_url, convert_google_drive_to_download, extract_google_drive_file_id,
                    is_google_docs_url, convert_google_docs_to_export, extract_google_docs_document_id)
@@ -571,6 +571,20 @@ class ContentFetcher:
         """从PDF文件提取文本，使用多种方法和候补策略"""
         logger.info(f"开始提取PDF文本: {pdf_path}")
         
+        # 方法0：使用 Document AI (优先方法) - 多模态LLM直接提取
+        if USE_DOCUMENT_AI:
+            logger.info("尝试方法0: Document AI 文本提取（优先）...")
+            text = self._extract_with_document_ai(pdf_path)
+            if text and len(text) > 0:
+                logger.info(f"Document AI 原始提取结果: {len(text)} 字符")
+                if self._is_valid_text(text):
+                    logger.info("✅ Document AI 提取成功且验证通过")
+                    return text
+                else:
+                    logger.warning("❌ Document AI 提取的文本未通过验证，尝试其他方法")
+            else:
+                logger.warning("❌ Document AI 未能提取到文本，尝试其他方法")
+        
         # 方法1：使用PyMuPDF (fitz) - 主要方法
         logger.info("尝试方法1: PyMuPDF文本提取...")
         text = self._extract_with_pymupdf(pdf_path)
@@ -625,6 +639,26 @@ class ContentFetcher:
         
         logger.error("❌ 所有PDF文本提取方法都失败，无法获取有效文本")
         return None
+    
+    def _extract_with_document_ai(self, pdf_path: Path) -> Optional[str]:
+        """使用 Document AI (多模态LLM) 提取PDF文本"""
+        try:
+            from document_ai import get_document_ai_extractor
+            
+            extractor = get_document_ai_extractor()
+            if not extractor.is_available:
+                logger.warning("Document AI 不可用")
+                return None
+            
+            text = extractor.extract_text_from_pdf(pdf_path)
+            return text
+            
+        except ImportError:
+            logger.warning("Document AI 模块导入失败")
+            return None
+        except Exception as e:
+            logger.error(f"Document AI 提取失败: {e}")
+            return None
     
     def _extract_with_pymupdf(self, pdf_path: Path) -> Optional[str]:
         """使用PyMuPDF提取文本"""

@@ -22,7 +22,7 @@ class PlaywrightProcessManager:
             logger.error(f"Playwright worker脚本不存在: {self.worker_script}")
             raise FileNotFoundError(f"找不到 {self.worker_script}")
     
-    def get_page_content(self, url: str, scroll_enabled: bool = True, timeout: int = 60) -> Optional[str]:
+    def get_page_content(self, url: str, scroll_enabled: bool = True, timeout: int = 120) -> Optional[str]:
         """
         通过独立进程获取页面内容
         
@@ -36,7 +36,7 @@ class PlaywrightProcessManager:
         """
         return self._run_playwright_task(url, scroll_enabled, False, timeout)
     
-    def capture_screenshots(self, url: str, timeout: int = 60) -> Optional[list]:
+    def capture_screenshots(self, url: str, timeout: int = 120) -> Optional[list]:
         """
         通过独立进程捕获页面截图
         
@@ -52,7 +52,7 @@ class PlaywrightProcessManager:
             return result.get('screenshots')
         return None
     
-    def _run_playwright_task(self, url: str, scroll_enabled: bool = True, screenshot_mode: bool = False, timeout: int = 60) -> Optional:
+    def _run_playwright_task(self, url: str, scroll_enabled: bool = True, screenshot_mode: bool = False, timeout: int = 120) -> Optional:
         """
         通过独立进程运行Playwright任务（内部方法）
         
@@ -133,7 +133,7 @@ class PlaywrightProcessManager:
         try:
             logger.info("测试Playwright连接...")
             test_url = "https://www.example.com"
-            content = self.get_page_content(test_url, scroll_enabled=False, timeout=30)
+            content = self.get_page_content(test_url, scroll_enabled=False, timeout=60)
             
             if content and len(content) > 100:
                 logger.info("✅ Playwright测试成功")

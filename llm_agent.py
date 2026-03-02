@@ -6,6 +6,7 @@ import logging
 import requests
 from typing import Optional, Dict, Any
 import time
+from datetime import datetime
 
 from config import OPENAI_MODEL, OPENAI_BASE_URL, OLLAMA_BASE_URL, OLLAMA_MODEL, check_openai_key
 from utils import validate_json_response, save_llm_conversation, check_ollama_availability
@@ -171,11 +172,17 @@ class LLMAgent:
         """英文分析阶段1：基本信息提取"""
         logger.info("开始英文分析阶段1")
         
+        # 获取当前日期
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        current_year = datetime.now().year
+        
         system_prompt = """You are an expert at extracting academic and research position information from text. You need to analyze the provided text and extract specific information in JSON format. 
 
 IMPORTANT: Respond ONLY with the JSON object. Do not include any explanation, reasoning, or additional text. Just return the pure JSON response."""
         
         prompt = f"""
+TODAY'S DATE: {current_date}
+
 TEXT TO ANALYZE:
 {text}
 
@@ -186,6 +193,9 @@ CRITICAL RULE:
 - You MUST return a COMPLETE JSON object with ALL required fields.
 
 1. "Deadline": Extract ONLY the "application deadline" that is explicitly mentioned in the text. Convert to YYYY-MM-DD format. If deadline is not mentioned, use "Soon".
+   - IMPORTANT: If the text only provides month and day without a year, infer the year based on today's date ({current_date}):
+     * If the month/day has already passed this year, assume it refers to next year ({current_year + 1})
+     * If the month/day has not yet passed this year, assume it refers to this year ({current_year})
 2. "Number_Places": Extract ONLY the number of positions that is explicitly stated. For academic positions (Master, PhD, PostDoc, Research Assistant), specify the exact number if mentioned. If there are multiple positions, the number should be added up. If not specified, should fill in "1". For events (Competition, Summer School, Conference, Workshop), leave empty.
 3. "Direction": Extract ONLY the research direction or project topic that is stated in the text. If not explicitly stated, summarize ONLY from the actual content provided. Please make sure that the first letter of the first word and special nouns are capitalized, and the others are lowercase.For example, “PhD Position: Using AI for Pandemic Preparedness and Building Resilient Healthcare Systems (PARAATHEID)” should be converted to “Using AI for pandemic preparedness and building resilient healthcare systems”.
 4. "University_EN": Extract ONLY the full English name of the university/institution that is EXPLICITLY mentioned. If the abbreviation of the school/institution is used in the text, use it after completing it. If not specified or uncertain, leave empty.
@@ -277,7 +287,7 @@ Position Types (mark "1" if mentioned, DO NOT include in response if not applica
 - "Conference": Academic conferences
 - "Workshop": Workshops
 
-Research Fields (mark "1" if the text content is related to the following categories, DO NOT include in response if not applicable. Maximum fill 5 fields, minimum fill 1 field.):
+Research Fields (STRICT LIMIT: Select MINIMUM 1, MAXIMUM 3 fields. NEVER exceed 3 fields. If content relates to more than 3 fields, you MUST choose only the TOP 3 most relevant. Any response with more than 3 Research Fields is INVALID. Mark "1" only for selected fields, DO NOT include unselected fields.):
 - "Physical_Geo": Physical Geography, Agriculture, Environmental Sciences, Climatology, Ecology, Geology, Earth Sciences, Hydrology, Biodiversity, Landscape Ecology, Climate Change, Soil Science, Natural Hazards, Geomorphology, Oceanography, Atmospheric Sciences, etc.
 - "Human_Geo": Human Geography, Health Geography, Economic Geography, Demography, Medical Geography, Social Geography, Cultural Geography, Political Geography, Population Studies, Migration Studies, Tourism Geography, Behavioral Geography, Development Studies, Regional Studies, etc.
 - "Urban": Urban Planning, Smart City, Land Use, Architecture, Sustainable Cities, Urban Design, Urban Development, City Planning, Metropolitan Studies, Urban Transportation, Urban Environment, Urban Policy, Housing Studies, Infrastructure Planning, Urban Analytics, Urban Modeling, etc.

@@ -37,9 +37,9 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
         logger.info(f"Playwright Worker: 开始处理 {url}")
         
         with sync_playwright() as p:
-            # 启动浏览器
+            # 启动浏览器（无头模式）
             browser = p.chromium.launch(
-                headless=True,
+                headless=False,
                 args=[
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
@@ -89,62 +89,64 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             except Exception as e:
                 logger.warning(f"初始页面加载超时（尝试继续）: {e}")
             
-            # 使用智能页面加载检测
-            try:
-                from config import (USE_SMART_PAGE_LOADER, SMART_LOAD_INITIAL_WAIT,
-                                  SMART_LOAD_MAX_WAIT, SMART_LOAD_STABILITY_INTERVAL,
-                                  SMART_LOAD_STABILITY_THRESHOLD, SMART_LOAD_MIN_CONTENT_LENGTH,
-                                  SMART_LOAD_MAX_RETRIES)
+            # 如果是截图模式，跳过智能加载，使用简单等待
+            if screenshot_mode:
+                logger.info("进入截图模式（跳过智能加载）...")
                 
-                if USE_SMART_PAGE_LOADER:
-                    logger.info("使用智能页面加载检测...")
-                    from smart_page_loader import create_smart_loader
+                # 简单等待页面渲染完成
+                try:
+                    page.wait_for_load_state('load', timeout=5000)
+                except Exception:
+                    pass
+                
+                # 短暂等待动态内容
+                page.wait_for_timeout(500)
+            else:
+                # 非截图模式：使用智能页面加载检测
+                try:
+                    from config import (USE_SMART_PAGE_LOADER, SMART_LOAD_INITIAL_WAIT,
+                                      SMART_LOAD_MAX_WAIT, SMART_LOAD_STABILITY_INTERVAL,
+                                      SMART_LOAD_STABILITY_THRESHOLD, SMART_LOAD_MIN_CONTENT_LENGTH,
+                                      SMART_LOAD_MAX_RETRIES)
                     
-                    smart_loader = create_smart_loader({
-                        'max_wait_time': SMART_LOAD_MAX_WAIT,
-                        'initial_wait': SMART_LOAD_INITIAL_WAIT,
-                        'stability_check_interval': SMART_LOAD_STABILITY_INTERVAL,
-                        'stability_threshold': SMART_LOAD_STABILITY_THRESHOLD,
-                        'min_content_length': SMART_LOAD_MIN_CONTENT_LENGTH
-                    })
-                    
-                    load_result = smart_loader.wait_for_page_with_retry(
-                        page, url, max_retries=SMART_LOAD_MAX_RETRIES
-                    )
-                    
-                    logger.info(f"智能加载完成: 策略={load_result['strategy']}, "
-                              f"耗时={load_result['wait_time']:.2f}s, "
-                              f"内容长度={load_result['content_length']}")
-                    
-                    if load_result['warnings']:
-                        for warning in load_result['warnings']:
-                            logger.warning(f"加载警告: {warning}")
-                else:
-                    # 使用传统方式等待
-                    logger.info("使用传统页面加载等待...")
+                    if USE_SMART_PAGE_LOADER:
+                        logger.info("使用智能页面加载检测...")
+                        from smart_page_loader import create_smart_loader
+                        
+                        smart_loader = create_smart_loader({
+                            'max_wait_time': SMART_LOAD_MAX_WAIT,
+                            'initial_wait': SMART_LOAD_INITIAL_WAIT,
+                            'stability_check_interval': SMART_LOAD_STABILITY_INTERVAL,
+                            'stability_threshold': SMART_LOAD_STABILITY_THRESHOLD,
+                            'min_content_length': SMART_LOAD_MIN_CONTENT_LENGTH
+                        })
+                        
+                        load_result = smart_loader.wait_for_page_with_retry(
+                            page, url, max_retries=SMART_LOAD_MAX_RETRIES
+                        )
+                        
+                        logger.info(f"智能加载完成: 策略={load_result['strategy']}, "
+                                  f"耗时={load_result['wait_time']:.2f}s, "
+                                  f"内容长度={load_result['content_length']}")
+                        
+                        if load_result['warnings']:
+                            for warning in load_result['warnings']:
+                                logger.warning(f"加载警告: {warning}")
+                    else:
+                        # 使用传统方式等待
+                        logger.info("使用传统页面加载等待...")
+                        page.wait_for_load_state('networkidle', timeout=30000)
+                        page.wait_for_timeout(3000)
+                except ImportError as e:
+                    logger.warning(f"无法导入智能加载器（使用传统方式）: {e}")
                     page.wait_for_load_state('networkidle', timeout=30000)
                     page.wait_for_timeout(3000)
-            except ImportError as e:
-                logger.warning(f"无法导入智能加载器（使用传统方式）: {e}")
-                page.wait_for_load_state('networkidle', timeout=30000)
-                page.wait_for_timeout(3000)
-            except Exception as e:
-                logger.warning(f"智能加载检测失败（继续处理）: {e}")
-                page.wait_for_timeout(3000)
+                except Exception as e:
+                    logger.warning(f"智能加载检测失败（继续处理）: {e}")
+                    page.wait_for_timeout(3000)
             
             # 如果是截图模式，执行截图
             if screenshot_mode:
-                logger.info("进入截图模式...")
-                
-                # 额外等待页面完全加载（特别是动态内容）
-                logger.info("等待页面完全加载...")
-                page.wait_for_timeout(3000)  # 额外等待3秒
-                
-                # 尝试等待body可见（如果失败也继续）
-                try:
-                    page.wait_for_selector('body', timeout=5000)
-                except Exception:
-                    pass
                 
                 screenshot_paths = capture_screenshots(page, url)
                 
@@ -338,7 +340,7 @@ def capture_screenshots(page, url: str) -> list:
                 # 滚动到对应位置
                 scroll_position = i * viewport_height
                 page.evaluate(f"window.scrollTo(0, {scroll_position})")
-                page.wait_for_timeout(500)  # 等待内容加载
+                page.wait_for_timeout(200)  # 从500ms缩短到200ms
                 
                 # 截图（PNG格式不支持quality参数）
                 screenshot_path = SCREENSHOT_CACHE_DIR / f"{domain}_{url_hash}_{i:03d}.png"
@@ -348,7 +350,7 @@ def capture_screenshots(page, url: str) -> list:
             
             # 滚动回顶部
             page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(200)
         
         logger.info(f"截图完成，共 {len(screenshot_paths)} 张")
         return screenshot_paths
@@ -379,8 +381,8 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
     try:
         screenshot_paths = []
         
-        # 等待PDF查看器加载
-        page.wait_for_timeout(2000)
+        # 等待PDF查看器加载（缩短等待时间）
+        page.wait_for_timeout(500)
         
         # 尝试查找并切换到iframe（腾讯文档可能使用iframe）
         try:
@@ -390,7 +392,7 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
                 if iframe:
                     logger.info("检测到iframe，切换到iframe内部")
                     page = iframe  # 在iframe内操作
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(300)
         except Exception as e:
             logger.debug(f"iframe检测: {e}")
         
@@ -421,7 +423,6 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
                 }
             """)
             logger.info("UI元素隐藏完成")
-            page.wait_for_timeout(500)
         except Exception as e:
             logger.debug(f"隐藏UI元素失败: {e}")
         
@@ -436,18 +437,18 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
                 # 向上滚动鼠标（缩小）
                 page.mouse.wheel(0, 100)
                 page.keyboard.up('Control')
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(200)  # 从500ms缩短到200ms
                 logger.debug(f"第{i+1}次缩小完成")
             
             logger.info("页面缩小完成")
-            page.wait_for_timeout(1000)  # 等待页面重新渲染
+            page.wait_for_timeout(300)  # 从1000ms缩短到300ms
         except Exception as e:
             logger.warning(f"页面缩小失败: {e}，继续使用原始大小")
         
         # 回到第1页（防止之前的操作影响）
         try:
             page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(200)
         except Exception:
             pass
         
@@ -502,7 +503,7 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
                 # 确保滚动到页面顶部
                 try:
                     page.evaluate("window.scrollTo(0, 0)")
-                    page.wait_for_timeout(800)
+                    page.wait_for_timeout(300)
                 except Exception as e:
                     logger.debug(f"重置滚动位置失败: {e}")
                 
@@ -536,7 +537,7 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
                                 if next_button:
                                     next_button.click()
                                     logger.info(f"点击下一页按钮: {selector}")
-                                    page.wait_for_timeout(1500)
+                                    page.wait_for_timeout(500)
                                     page_turned = True
                                     break
                         except Exception as e:
@@ -547,7 +548,7 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
                             try:
                                 logger.info("使用键盘ArrowDown翻页")
                                 page.keyboard.press('ArrowDown')
-                                page.wait_for_timeout(1500)
+                                page.wait_for_timeout(500)
                                 page_turned = True
                             except Exception as e:
                                 logger.debug(f"键盘翻页失败: {e}")
@@ -653,7 +654,7 @@ def scroll_and_capture_page(page, cache_dir, domain: str, url_hash: str, page_nu
             # 向下滚动
             try:
                 page.evaluate(f"window.scrollBy(0, {scroll_step})")
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(200)  # 从400ms缩短到200ms
                 scroll_count += 1
                 
                 # 检查是否翻页了

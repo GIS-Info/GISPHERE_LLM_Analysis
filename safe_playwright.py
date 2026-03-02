@@ -41,7 +41,7 @@ class SafePlaywrightWrapper:
                         
                         playwright = sync_playwright().start()
                         browser = playwright.chromium.launch(
-                            headless=True,
+                            headless=False,
                             args=[
                                 '--no-sandbox',
                                 '--disable-dev-shm-usage',

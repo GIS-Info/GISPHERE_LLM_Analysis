@@ -1,21 +1,46 @@
 """
 分析阶段封装模块
 """
+import os
 import logging
 from typing import Dict, Optional, Tuple
 from llm_agent import LLMAgent
 from excel_handler import validate_analysis_result
 from contact_verifier import ContactVerifier
 from utils import clean_email_format
+from config import ENABLE_WEB_SEARCH, PLAYWRIGHT_MCP_HEADLESS
 
 logger = logging.getLogger(__name__)
 
 class AnalysisStageManager:
     def __init__(self):
         self.llm_agent = LLMAgent()
-        self.contact_verifier = ContactVerifier(self.llm_agent)
-        self.current_row_index = None
         self._cleaned = False  # 添加清理标志
+        
+        # 初始化 Playwright MCP 客户端（用于联系人网络搜索）
+        self.mcp_client = None
+        if ENABLE_WEB_SEARCH:
+            try:
+                from mcp_client import MCPClientWrapper
+                playwright_args = ["@playwright/mcp@latest", "--isolated"]
+                if PLAYWRIGHT_MCP_HEADLESS:
+                    playwright_args.append("--headless")
+                mcp_configs = [{
+                    "name": "playwright",
+                    "command": "npx",
+                    "args": playwright_args
+                }]
+                self.mcp_client = MCPClientWrapper()
+                self.mcp_client.initialize(mcp_configs)
+                logger.info("✅ Playwright MCP 客户端初始化成功")
+            except Exception as e:
+                logger.warning(f"Playwright MCP 初始化失败，联系人搜索将被跳过: {e}")
+                self.mcp_client = None
+        else:
+            logger.info("网络搜索已禁用 (ENABLE_WEB_SEARCH=0)，跳过 MCP 初始化")
+        
+        self.contact_verifier = ContactVerifier(self.llm_agent, mcp_client=self.mcp_client)
+        self.current_row_index = None
         
     def analyze_text_complete(self, text: str, row_index: int) -> Tuple[bool, Dict, str]:
         """
@@ -206,7 +231,7 @@ class AnalysisStageManager:
     def cleanup(self):
         """清理资源"""
         # 检查是否已经清理，避免重复清理
-        if self._cleaned:
+        if getattr(self, '_cleaned', False):
             return
         
         if hasattr(self, 'contact_verifier') and self.contact_verifier:
@@ -216,6 +241,16 @@ class AnalysisStageManager:
                 logger.warning(f"清理联系人验证器资源失败: {e}")
             finally:
                 self.contact_verifier = None
+        
+        # 关闭 Playwright MCP 进程
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            try:
+                self.mcp_client.cleanup()
+                logger.info("Playwright MCP 客户端已关闭")
+            except Exception as e:
+                logger.warning(f"关闭 MCP 客户端失败: {e}")
+            finally:
+                self.mcp_client = None
         
         self._cleaned = True  # 标记为已清理
     

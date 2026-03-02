@@ -418,12 +418,20 @@ class GoogleSheetsHandler:
         
         total_rows = len(self.df)
         filled_rows = len(self.df[self.df['Verifier'].notna() & (self.df['Verifier'] != '')])
-        error_rows = len(self.df[self.df['Error'].notna() & (self.df['Error'] != '')])
-        pending_rows = total_rows - filled_rows - error_rows
+        # "N"表示"已审核"，单独统计
+        reviewed_rows = len(self.df[self.df['Error'] == 'N'])
+        # 真正的错误行（Error不为空且不为"N"）
+        error_rows = len(self.df[self.df['Error'].notna() & (self.df['Error'] != '') & (self.df['Error'] != 'N')])
+        # 待处理：Verifier和Error都为空的行
+        pending_rows = len(self.df[
+            (self.df['Verifier'].isna() | (self.df['Verifier'] == '')) &
+            (self.df['Error'].isna() | (self.df['Error'] == ''))
+        ])
         
         stats = {
             'total_rows': total_rows,
             'filled_rows': filled_rows,
+            'reviewed_rows': reviewed_rows,
             'error_rows': error_rows,
             'pending_rows': pending_rows,
             'completion_rate': filled_rows / total_rows * 100 if total_rows > 0 else 0
@@ -442,6 +450,7 @@ class GoogleSheetsHandler:
         logger.info("处理统计信息:")
         logger.info(f"总行数: {stats['total_rows']}")
         logger.info(f"已完成: {stats['filled_rows']}")
+        logger.info(f"已审核: {stats['reviewed_rows']}")
         logger.info(f"错误: {stats['error_rows']}")
         logger.info(f"待处理: {stats['pending_rows']}")
         logger.info(f"完成率: {stats['completion_rate']:.1f}%")

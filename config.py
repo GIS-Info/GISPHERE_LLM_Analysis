@@ -11,11 +11,14 @@ PROJECT_ROOT = Path(__file__).parent.absolute()
 # 文件路径配置
 EXCEL_FILE = PROJECT_ROOT / "text_info.xlsx"  # 保留作为备用
 SHEET_NAME = "Unfilled"
-OPENAI_KEY_FILE = PROJECT_ROOT / "openai_key.txt"
+
+# 密钥和凭证目录
+KEYS_DIR = PROJECT_ROOT / "keys"
+OPENAI_KEY_FILE = KEYS_DIR / "openai_key.txt"
 
 # Google Sheets 配置
-GOOGLE_CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
-GOOGLE_TOKEN_FILE = PROJECT_ROOT / "token.pickle"
+GOOGLE_CREDENTIALS_FILE = KEYS_DIR / "credentials.json"
+GOOGLE_TOKEN_FILE = KEYS_DIR / "token.pickle"
 GOOGLE_SPREADSHEET_ID = '1LcfxcTCuj9ZJXXMxyFQwt-xnbAviNP8j9oDr6OG5-Go'
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
@@ -38,17 +41,17 @@ SCROLL_BUFFER = 1000  # 页面底部缓冲像素数
 
 # Playwright配置
 USE_PLAYWRIGHT = True  # 是否使用Playwright（通过独立进程，无异步冲突）
-PLAYWRIGHT_TIMEOUT = 60  # Playwright页面加载超时时间（秒）
+PLAYWRIGHT_TIMEOUT = 120  # Playwright页面加载超时时间（秒）- 增加到120秒
 PLAYWRIGHT_SCROLL_ENABLED = True  # 是否启用滚动加载
 
 # 智能页面加载配置
 USE_SMART_PAGE_LOADER = True  # 是否使用智能页面加载检测
-SMART_LOAD_INITIAL_WAIT = 15  # 智能检测前的初始等待时间（秒），给页面足够时间加载
-SMART_LOAD_MAX_WAIT = 60  # 智能加载最大等待时间（秒）
-SMART_LOAD_STABILITY_INTERVAL = 1.0  # 内容稳定性检查间隔（秒）
-SMART_LOAD_STABILITY_THRESHOLD = 3  # 内容稳定性阈值（连续N次无变化）
-SMART_LOAD_MIN_CONTENT_LENGTH = 500  # 最小内容长度阈值
-SMART_LOAD_MAX_RETRIES = 2  # 加载失败时的最大重试次数
+SMART_LOAD_INITIAL_WAIT = 5  # 智能检测前的初始等待时间（秒）- 从15秒减少到5秒
+SMART_LOAD_MAX_WAIT = 30  # 智能加载最大等待时间（秒）- 从60秒减少到30秒
+SMART_LOAD_STABILITY_INTERVAL = 0.5  # 内容稳定性检查间隔（秒）- 从1秒减少到0.5秒
+SMART_LOAD_STABILITY_THRESHOLD = 2  # 内容稳定性阈值（连续N次无变化）- 从3次减少到2次
+SMART_LOAD_MIN_CONTENT_LENGTH = 200  # 最小内容长度阈值 - 从500减少到200
+SMART_LOAD_MAX_RETRIES = 1  # 加载失败时的最大重试次数 - 从2次减少到1次
 
 # 截图OCR配置
 USE_SCREENSHOT_OCR = True  # 是否启用截图OCR作为fallback
@@ -58,10 +61,16 @@ SCREENSHOT_MAX_PAGES = 10  # 长页面最大截图页数
 SCREENSHOT_CLEANUP_AFTER_USE = True  # 使用后是否自动清理截图
 
 # LLM 配置
-OPENAI_MODEL = "gpt-5-chat-latest"
+OPENAI_MODEL = "gpt-5-chat"
 OPENAI_BASE_URL = "https://oneapi.gisphere.info/v1"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3:14b"
+
+# Document AI 配置 (用于PDF/图片文字提取)
+USE_DOCUMENT_AI = True  # 是否启用 Document AI 进行文字提取（优先于OCR）
+DOCUMENT_AI_MODEL = "gemini-2.5-flash"  # 多模态文档理解模型 (支持 Vision)
+DOCUMENT_AI_MAX_PAGES = 10  # Document AI 处理的最大页数
+DOCUMENT_AI_TIMEOUT = 120  # Document AI 调用超时时间（秒）
 
 # Excel 列名配置
 EXCEL_COLUMNS = {
@@ -119,6 +128,12 @@ CONTACT_VERIFICATION_ENABLED = True
 CONTACT_SEARCH_TIMEOUT = 20
 MAX_SEARCH_RESULTS = 10
 MAX_PAGES_TO_ANALYZE = 3
+
+# 网络搜索配置（基于 Playwright MCP）
+# 设置环境变量 ENABLE_WEB_SEARCH=0 可完全禁用联系人网络搜索
+ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "1").lower() in ("1", "true", "yes", "on")
+# 设置环境变量 PLAYWRIGHT_MCP_HEADLESS=1 可启用无头模式（服务器环境适用）
+PLAYWRIGHT_MCP_HEADLESS = os.getenv("PLAYWRIGHT_MCP_HEADLESS", "0").lower() in ("1", "true", "yes", "on")
 
 # 日志配置
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

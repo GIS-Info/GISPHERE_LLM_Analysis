@@ -1,20 +1,46 @@
 """
 截图OCR提取器 - 从截图图像中提取文本内容
+支持 Document AI (优先) 和 Tesseract OCR (降级) 两种方案
 """
 import logging
 from pathlib import Path
 from typing import Optional, List
 import io
 
+from config import USE_DOCUMENT_AI
+
 logger = logging.getLogger(__name__)
 
 class ScreenshotOCRFetcher:
-    """从截图图像中提取文本的OCR提取器"""
+    """从截图图像中提取文本的提取器，优先使用 Document AI，降级使用 OCR"""
     
     def __init__(self):
         self._ocr_available = self._check_ocr_availability()
-        if not self._ocr_available:
-            logger.warning("OCR功能不可用，请确保已安装pytesseract和Tesseract OCR引擎")
+        self._document_ai_available = self._check_document_ai_availability()
+        
+        if self._document_ai_available:
+            logger.info("✅ Document AI 可用，将优先使用")
+        elif self._ocr_available:
+            logger.info("✅ Tesseract OCR 可用，将作为文字提取方案")
+        else:
+            logger.warning("⚠️ Document AI 和 OCR 都不可用")
+    
+    def _check_document_ai_availability(self) -> bool:
+        """检查 Document AI 是否可用"""
+        if not USE_DOCUMENT_AI:
+            logger.info("Document AI 已在配置中禁用")
+            return False
+        
+        try:
+            from document_ai import get_document_ai_extractor
+            extractor = get_document_ai_extractor()
+            return extractor.is_available
+        except ImportError:
+            logger.warning("Document AI 模块导入失败")
+            return False
+        except Exception as e:
+            logger.warning(f"Document AI 检查失败: {e}")
+            return False
     
     def _check_ocr_availability(self) -> bool:
         """检查OCR依赖是否可用"""
@@ -64,6 +90,7 @@ class ScreenshotOCRFetcher:
     def extract_text_from_screenshots(self, screenshot_paths: List[str]) -> Optional[str]:
         """
         从截图列表中提取文本
+        优先使用 Document AI，失败则降级使用 Tesseract OCR
         
         Args:
             screenshot_paths: 截图文件路径列表
@@ -71,14 +98,47 @@ class ScreenshotOCRFetcher:
         Returns:
             str: 提取的文本内容，失败返回None
         """
-        if not self._ocr_available:
-            logger.error("OCR功能不可用")
-            return None
-        
         if not screenshot_paths:
             logger.error("截图路径列表为空")
             return None
         
+        # 方法1：优先使用 Document AI
+        if self._document_ai_available:
+            logger.info(f"尝试使用 Document AI 处理 {len(screenshot_paths)} 张截图...")
+            text = self._extract_with_document_ai(screenshot_paths)
+            if text and text.strip():
+                logger.info(f"✅ Document AI 提取成功，共 {len(text)} 字符")
+                # 清理截图文件
+                self._cleanup_screenshots(screenshot_paths)
+                return text
+            else:
+                logger.warning("Document AI 提取失败，尝试降级使用 OCR...")
+        
+        # 方法2：降级使用 Tesseract OCR
+        if not self._ocr_available:
+            logger.error("OCR功能不可用，无法提取文本")
+            return None
+        
+        return self._extract_with_tesseract_ocr(screenshot_paths)
+    
+    def _extract_with_document_ai(self, screenshot_paths: List[str]) -> Optional[str]:
+        """使用 Document AI 从截图中提取文本"""
+        try:
+            from document_ai import get_document_ai_extractor
+            
+            extractor = get_document_ai_extractor()
+            if not extractor.is_available:
+                return None
+            
+            text = extractor.extract_text_from_images(screenshot_paths)
+            return text
+            
+        except Exception as e:
+            logger.error(f"Document AI 提取异常: {e}")
+            return None
+    
+    def _extract_with_tesseract_ocr(self, screenshot_paths: List[str]) -> Optional[str]:
+        """使用 Tesseract OCR 从截图中提取文本"""
         try:
             import pytesseract
             from PIL import Image
@@ -163,6 +223,22 @@ class ScreenshotOCRFetcher:
         except Exception as e:
             logger.error(f"OCR处理过程发生异常: {e}")
             return None
+    
+    def _cleanup_screenshots(self, screenshot_paths: List[str]) -> None:
+        """清理截图文件"""
+        from config import SCREENSHOT_CLEANUP_AFTER_USE
+        
+        if not SCREENSHOT_CLEANUP_AFTER_USE:
+            return
+        
+        for screenshot_path in screenshot_paths:
+            try:
+                screenshot_file = Path(screenshot_path)
+                if screenshot_file.exists():
+                    screenshot_file.unlink()
+                    logger.debug(f"已删除截图文件: {screenshot_file.name}")
+            except Exception as e:
+                logger.warning(f"删除截图文件失败: {e}")
     
     def _preprocess_image(self, img):
         """
