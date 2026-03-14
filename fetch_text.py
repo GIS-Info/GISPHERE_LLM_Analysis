@@ -11,7 +11,8 @@ import hashlib
 import time
 import re
 import io
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple
 import sys
 
 from config import PDF_CACHE_DIR, REQUEST_TIMEOUT, PDF_DOWNLOAD_TIMEOUT, MAX_RETRIES, USE_DOCUMENT_AI
@@ -20,6 +21,17 @@ from utils import (is_pdf_url, sanitize_filename, normalize_text,
                    is_google_docs_url, convert_google_docs_to_export, extract_google_docs_document_id)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FetchAttemptResult:
+    """单次抓取尝试的结果，用于统一评估不同抓取方式的质量。"""
+    method: str
+    content: Optional[str]
+    score: int
+    quality: str
+    flags: List[str] = field(default_factory=list)
+    reason: str = ""
 
 class ContentFetcher:
     def __init__(self):
@@ -46,6 +58,7 @@ class ContentFetcher:
         
         # 存储当前处理的PDF文件路径，用于后续清理
         self.current_pdf_file = None
+        self.last_fetch_summary = {}
         
         # 初始化截图OCR提取器
         self.screenshot_ocr_fetcher = None
@@ -59,6 +72,49 @@ class ContentFetcher:
                 logger.info("截图OCR已在配置中禁用")
         except Exception as e:
             logger.warning(f"截图OCR提取器初始化失败: {e}")
+
+    def _reset_last_fetch_summary(self, url: str):
+        """重置最近一次抓取摘要。"""
+        self.last_fetch_summary = {
+            "url": url,
+            "content_type": None,
+            "selected_method": None,
+            "selected_quality": None,
+            "selected_score": None,
+            "selected_reason": "",
+            "attempts": [],
+            "final_status": "started"
+        }
+
+    def _record_fetch_attempt(self, attempt: FetchAttemptResult):
+        """记录一次抓取尝试，供主流程输出摘要日志。"""
+        self.last_fetch_summary.setdefault("attempts", []).append({
+            "method": attempt.method,
+            "quality": attempt.quality,
+            "score": attempt.score,
+            "flags": list(attempt.flags),
+            "reason": attempt.reason,
+            "content_length": len(attempt.content) if attempt.content else 0
+        })
+
+    def _finalize_fetch_summary(
+        self,
+        selected_method: Optional[str],
+        final_status: str,
+        selected_quality: Optional[str] = None,
+        selected_score: Optional[int] = None,
+        selected_reason: str = ""
+    ):
+        """记录最终抓取结果。"""
+        self.last_fetch_summary["selected_method"] = selected_method
+        self.last_fetch_summary["selected_quality"] = selected_quality
+        self.last_fetch_summary["selected_score"] = selected_score
+        self.last_fetch_summary["selected_reason"] = selected_reason
+        self.last_fetch_summary["final_status"] = final_status
+
+    def get_last_fetch_summary(self) -> dict:
+        """返回最近一次抓取摘要。"""
+        return dict(self.last_fetch_summary)
     
     def fetch_content(self, url: str) -> Optional[str]:
         """根据URL类型获取内容"""
@@ -67,60 +123,67 @@ class ContentFetcher:
             return None
         
         logger.info(f"开始获取内容: {url}")
+        self._reset_last_fetch_summary(url)
         
         try:
             # 优先处理Google Docs链接
             if is_google_docs_url(url):
                 logger.info("检测到Google Docs链接，使用特殊处理流程")
-                return self._handle_google_docs_url(url)
+                content = self._handle_google_docs_url(url)
+                self._finalize_fetch_summary(
+                    "google_docs",
+                    "success" if content else "failed",
+                    "special",
+                    len(content) if content else 0,
+                    "Google Docs 专用流程"
+                )
+                return content
             
             # 优先处理Google Drive链接
             if is_google_drive_url(url):
                 logger.info("检测到Google Drive链接，使用特殊处理流程")
-                return self._handle_google_drive_url(url)
+                content = self._handle_google_drive_url(url)
+                self._finalize_fetch_summary(
+                    "google_drive",
+                    "success" if content else "failed",
+                    "special",
+                    len(content) if content else 0,
+                    "Google Drive 专用流程"
+                )
+                return content
             
             # 首先尝试基于URL判断
             if is_pdf_url(url):
                 logger.info("根据URL判断为PDF文件，使用PDF处理流程")
-                return self._fetch_pdf_content(url)
+                content = self._fetch_pdf_content(url)
+                self._finalize_fetch_summary(
+                    "pdf",
+                    "success" if content else "failed",
+                    "special",
+                    len(content) if content else 0,
+                    "PDF 专用流程"
+                )
+                return content
             else:
                 # 对于不确定的URL，先尝试获取响应头来判断
                 logger.info("URL类型不明确，检查内容类型...")
                 content_type = self._check_content_type(url)
+                self.last_fetch_summary["content_type"] = content_type
                 
                 if content_type and 'pdf' in content_type.lower():
                     logger.info(f"根据Content-Type判断为PDF: {content_type}")
-                    return self._fetch_pdf_content(url)
+                    content = self._fetch_pdf_content(url)
+                    self._finalize_fetch_summary(
+                        "pdf",
+                        "success" if content else "failed",
+                        "special",
+                        len(content) if content else 0,
+                        f"根据 Content-Type 判定为 PDF: {content_type}"
+                    )
+                    return content
                 else:
                     logger.info(f"根据Content-Type判断为网页: {content_type}")
-                    
-                    # 对于已知的JavaScript-heavy网站，优先使用Playwright
-                    if self._is_javascript_heavy_site(url) and self.playwright_manager:
-                        logger.info("检测到JavaScript-heavy网站，使用Playwright获取内容")
-                        content = self._fetch_web_content_with_playwright(url)
-                    else:
-                        content = self._fetch_web_content(url)
-                    
-                    # 对网页内容也进行基本验证
-                    if content:
-                        if self._is_likely_pdf_content(content):
-                            logger.warning("⚠️  网页内容疑似PDF乱码，尝试PDF处理流程")
-                            # 如果网页内容看起来像PDF乱码，尝试PDF处理
-                            return self._fetch_pdf_content(url)
-                        else:
-                            logger.info("✅ 网页内容验证通过")
-                    
-                    # 如果常规方法失败，尝试截图OCR作为fallback
-                    if not content or self._is_unavailable_content(content):
-                        logger.warning("⚠️  常规方法获取内容失败或内容不可用，尝试截图OCR...")
-                        screenshot_content = self._fetch_content_with_screenshot_ocr(url)
-                        if screenshot_content:
-                            logger.info("✅ 通过截图OCR成功获取内容")
-                            return screenshot_content
-                        else:
-                            logger.warning("截图OCR也失败，返回常规方法的结果（可能为空）")
-                    
-                    return content
+                    return self._fetch_web_content_with_strategy(url)
         except Exception as e:
             logger.error(f"获取内容失败: {e}")
             # 异常情况下也尝试截图OCR
@@ -129,8 +192,296 @@ class ContentFetcher:
                 screenshot_content = self._fetch_content_with_screenshot_ocr(url)
                 if screenshot_content:
                     logger.info("✅ 通过截图OCR成功获取内容（异常恢复）")
+                    self._finalize_fetch_summary(
+                        "ocr",
+                        "recovered_from_exception",
+                        "fallback",
+                        len(screenshot_content),
+                        "异常恢复后使用截图 OCR 成功"
+                    )
                     return screenshot_content
+            self._finalize_fetch_summary(None, "exception", None, None, str(e))
             return None
+
+    def _get_web_fetch_strategy(self, url: str) -> List[str]:
+        """
+        返回网页抓取策略链。
+
+        当前统一从 HTTP 开始，未来可以在这里按域名/历史结果调整优先级，
+        为后续方案 C 的“最优抓取方式记忆”预留扩展点。
+        """
+        strategy = ["http"]
+
+        if self.playwright_manager:
+            strategy.append("playwright")
+
+        if self.screenshot_ocr_fetcher and self.playwright_manager:
+            strategy.append("ocr")
+
+        logger.info(f"网页抓取策略: {strategy} ({url})")
+        return strategy
+
+    def _fetch_web_content_with_strategy(self, url: str) -> Optional[str]:
+        """按统一策略链抓取网页内容，并基于内容质量逐级升级抓取方式。"""
+        attempts: List[FetchAttemptResult] = []
+
+        for method in self._get_web_fetch_strategy(url):
+            attempt = self._run_web_fetch_attempt(url, method)
+            attempts.append(attempt)
+            self._record_fetch_attempt(attempt)
+
+            logger.info(
+                f"抓取尝试[{method}] 质量={attempt.quality}, 分数={attempt.score}, "
+                f"标记={attempt.flags if attempt.flags else ['ok']}, 原因={attempt.reason}"
+            )
+
+            if "pdf_like_content" in attempt.flags:
+                logger.warning("⚠️  检测到网页内容疑似PDF乱码，切换到PDF处理流程")
+                pdf_content = self._fetch_pdf_content(url)
+                self._finalize_fetch_summary(
+                    "pdf",
+                    "success" if pdf_content else "failed",
+                    "special",
+                    len(pdf_content) if pdf_content else 0,
+                    "网页内容疑似 PDF 乱码，转为 PDF 处理"
+                )
+                return pdf_content
+
+            if "challenge_page" in attempt.flags and method == "playwright":
+                logger.error("❌ Playwright 仍被验证页阻塞，停止继续升级到 OCR")
+                break
+
+            if attempt.quality == "good":
+                logger.info(f"✅ 使用 {method} 获取到高质量网页内容")
+                self._finalize_fetch_summary(
+                    method,
+                    "success",
+                    attempt.quality,
+                    attempt.score,
+                    attempt.reason
+                )
+                return attempt.content
+
+            if attempt.quality == "weak":
+                logger.warning(f"⚠️  {method} 获取到的内容质量一般，尝试更强的抓取方式")
+            else:
+                logger.warning(f"⚠️  {method} 获取到的内容质量较差，继续升级抓取方式")
+
+        best_attempt = self._select_best_web_attempt(attempts)
+        if best_attempt and best_attempt.content and best_attempt.score >= 35:
+            logger.warning(
+                f"未获取到高质量网页内容，返回最佳候选: 方法={best_attempt.method}, "
+                f"质量={best_attempt.quality}, 分数={best_attempt.score}"
+            )
+            self._finalize_fetch_summary(
+                best_attempt.method,
+                "best_effort",
+                best_attempt.quality,
+                best_attempt.score,
+                best_attempt.reason
+            )
+            return best_attempt.content
+
+        logger.error("❌ 所有网页抓取方式都未获取到可用内容")
+        self._finalize_fetch_summary(None, "failed", None, None, "所有抓取方式均未通过质量门槛")
+        return None
+
+    def _run_web_fetch_attempt(self, url: str, method: str) -> FetchAttemptResult:
+        """执行单次网页抓取尝试并产出统一结果。"""
+        if method == "http":
+            content = self._fetch_web_content(url)
+        elif method == "playwright":
+            content = self._fetch_web_content_with_playwright(url)
+        elif method == "ocr":
+            content = self._fetch_content_with_screenshot_ocr(url)
+        else:
+            logger.warning(f"未知抓取方式: {method}")
+            content = None
+
+        score, quality, flags, reason = self._evaluate_web_content_quality(content)
+        return FetchAttemptResult(
+            method=method,
+            content=content,
+            score=score,
+            quality=quality,
+            flags=flags,
+            reason=reason
+        )
+
+    def _select_best_web_attempt(self, attempts: List[FetchAttemptResult]) -> Optional[FetchAttemptResult]:
+        """从多次抓取尝试中选择质量最好的结果。"""
+        valid_attempts = [attempt for attempt in attempts if attempt.content]
+        if not valid_attempts:
+            return None
+        return max(valid_attempts, key=lambda attempt: attempt.score)
+
+    def _evaluate_web_content_quality(self, content: Optional[str]) -> Tuple[int, str, List[str], str]:
+        """统一评估网页内容质量，避免将模板页、壳页或过短文本误判为成功。"""
+        if not content or not content.strip():
+            return 0, "bad", ["empty_content"], "未获取到文本内容"
+
+        normalized = normalize_text(content)
+        text_lower = normalized.lower()
+        flags: List[str] = []
+        score = 100
+
+        content_length = len(normalized)
+        word_matches = re.findall(r"\b[\w-]+\b", normalized)
+        word_count = len(word_matches)
+        unique_words = len(set(word.lower() for word in word_matches if len(word) >= 3))
+
+        if self._is_likely_pdf_content(normalized):
+            flags.append("pdf_like_content")
+            score -= 80
+
+        if self._is_unavailable_content(normalized):
+            flags.append("unavailable_page")
+            score -= 45
+
+        template_patterns = [
+            r"\{\{[^{}]+\}\}",
+            r"\{\$[^{}]+\}",
+            r"\$\{[^{}]+\}"
+        ]
+        if any(re.search(pattern, normalized) for pattern in template_patterns):
+            flags.append("template_placeholders")
+            score -= 60
+
+        if "{{$ctrl" in text_lower:
+            flags.append("framework_placeholders")
+            score -= 20
+
+        if content_length < 80:
+            flags.append("too_short")
+            score -= 55
+        elif content_length < 200:
+            flags.append("short_content")
+            score -= 35
+        elif content_length < 500:
+            flags.append("limited_content")
+            score -= 15
+        elif content_length > 1500:
+            score += 10
+
+        if word_count < 40:
+            flags.append("low_word_count")
+            score -= 20
+        elif word_count > 250:
+            score += 5
+
+        if unique_words < 20:
+            flags.append("low_unique_words")
+            score -= 15
+
+        shell_signals = [
+            "sign in",
+            "log in",
+            "create account",
+            "forgot your password",
+            "cookie settings",
+            "accept cookies",
+            "privacy policy",
+            "terms of service",
+            "accessibility policy",
+            "equal opportunity employer",
+            "all rights reserved"
+        ]
+        shell_hits = sum(1 for signal in shell_signals if signal in text_lower)
+        if shell_hits >= 3:
+            flags.append("shell_page_signals")
+            shell_penalty = min(35, shell_hits * (10 if content_length < 800 else 4))
+            score -= shell_penalty
+
+        challenge_signals = [
+            "just a moment",
+            "verifying you are human",
+            "performing security verification",
+            "verification successful",
+            "enable javascript and cookies to continue",
+            "performance and security by cloudflare",
+            "ray id"
+        ]
+        challenge_hits = sum(1 for signal in challenge_signals if signal in text_lower)
+        if challenge_hits >= 2:
+            flags.append("challenge_page")
+            score -= 95
+
+        portal_shell_signals = [
+            "my jobpage",
+            "my job cart",
+            "my saved searches",
+            "my referrals",
+            "my account options",
+            "this service is set to disconnect automatically",
+            "you have been signed out",
+            "beginning of the main content section",
+            "return to previous position on page",
+            "refer a friend for this job",
+            "submit a candidate's profile"
+        ]
+        portal_hits = sum(1 for signal in portal_shell_signals if signal in text_lower)
+        if portal_hits >= 2:
+            flags.append("portal_shell_page")
+            score -= min(55, portal_hits * 18)
+
+        if re.search(r"\{\d+\}", normalized):
+            flags.append("session_placeholders")
+            score -= 25
+
+        body_keywords = [
+            "description",
+            "requirements",
+            "qualifications",
+            "deadline",
+            "responsibilities",
+            "application instructions",
+            "application process",
+            "research",
+            "position",
+            "university",
+            "contact"
+        ]
+        body_hits = sum(1 for keyword in body_keywords if keyword in text_lower)
+        if body_hits == 0:
+            flags.append("missing_body_keywords")
+            score -= 20
+        else:
+            score += min(20, body_hits * 4)
+
+        detail_keywords = [
+            "required qualifications",
+            "preferred qualifications",
+            "brief description of duties",
+            "job description -",
+            "essential duties",
+            "minimum qualifications",
+            "about the role",
+            "application deadline"
+        ]
+        detail_hits = sum(1 for keyword in detail_keywords if keyword in text_lower)
+        if detail_hits >= 2:
+            score += min(25, detail_hits * 8)
+        elif "portal_shell_page" in flags:
+            flags.append("missing_detail_sections")
+            score -= 20
+
+        # 短页面如果同时出现 challenge/portal 特征，应直接视为低质量壳页。
+        if content_length < 1200 and ("challenge_page" in flags or "portal_shell_page" in flags):
+            score -= 25
+
+        score = max(0, min(100, score))
+
+        if score >= 60:
+            quality = "good"
+            reason = "正文特征充足"
+        elif score >= 35:
+            quality = "weak"
+            reason = "内容存在但质量一般"
+        else:
+            quality = "bad"
+            reason = "内容疑似模板页、壳页或无效文本"
+
+        return score, quality, flags, reason
     
     def _handle_google_drive_url(self, url: str) -> Optional[str]:
         """处理Google Drive链接，尝试下载PDF或提取文本"""
@@ -1101,7 +1452,7 @@ class ContentFetcher:
             return None
     
     def _is_javascript_heavy_site(self, url: str) -> bool:
-        """判断是否为JavaScript-heavy网站"""
+        """遗留的站点提示逻辑，当前统一策略链不再依赖它做主流程分流。"""
         javascript_heavy_domains = [
             'jobbnorge.no',
             'linkedin.com',
@@ -1118,10 +1469,10 @@ class ContentFetcher:
         return False
     
     def _fetch_web_content_with_playwright(self, url: str) -> Optional[str]:
-        """使用Playwright获取网页内容（通过独立进程）"""
+        """使用Playwright获取网页内容（通过独立进程）。"""
         if not self.playwright_manager:
-            logger.warning("Playwright进程管理器未初始化，回退到基础HTTP请求")
-            return self._fetch_web_content(url)
+            logger.warning("Playwright进程管理器未初始化")
+            return None
         
         try:
             from config import PLAYWRIGHT_TIMEOUT, PLAYWRIGHT_SCROLL_ENABLED
@@ -1137,12 +1488,12 @@ class ContentFetcher:
                 logger.info(f"✅ Playwright独立进程获取内容成功，长度: {len(content)} 字符")
                 return content
             else:
-                logger.warning("Playwright获取的内容过短或为空，回退到基础HTTP请求")
-                return self._fetch_web_content(url)
+                logger.warning("Playwright获取的内容过短或为空")
+                return None
                 
         except Exception as e:
-            logger.warning(f"Playwright独立进程获取内容失败: {e}，回退到基础HTTP请求")
-            return self._fetch_web_content(url)
+            logger.warning(f"Playwright独立进程获取内容失败: {e}")
+            return None
     
     def _check_content_type(self, url: str) -> Optional[str]:
         """检查URL的Content-Type"""
@@ -1163,7 +1514,7 @@ class ContentFetcher:
         
         # 检查是否包含PDF标记
         pdf_indicators = [
-            '%PDF-', 'endobj', 'stream', 'endstream', '/Type', '/Catalog',
+            '%PDF-', 'endobj', 'endstream', '/Type', '/Catalog',
             'Binary data follows', 'Font substitution', 'Invalid encoding',
             '/MediaBox', '/Contents', '/XObject', '/ProcSet'
         ]
@@ -1173,7 +1524,7 @@ class ContentFetcher:
         indicator_count = sum(1 for indicator in pdf_indicators if indicator in check_content)
         
         # 如果发现PDF指示符，可能是PDF乱码
-        if indicator_count >= 1:  # 降低阈值
+        if indicator_count >= 2:  # 需要至少2个特征词才判定为PDF乱码
             logger.info(f"在内容中检测到 {indicator_count} 个PDF指示符")
             return True
         

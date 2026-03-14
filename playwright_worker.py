@@ -18,6 +18,71 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def html_to_text(html: str) -> str:
+    """将 HTML 清洗为纯文本。"""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    for script in soup(["script", "style", "nav", "footer", "header"]):
+        script.decompose()
+
+    text = soup.get_text()
+    lines = (line.strip() for line in text.splitlines())
+    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+    return ' '.join(chunk for chunk in chunks if chunk)
+
+
+def is_challenge_page_text(text: str) -> bool:
+    """检测是否为 Cloudflare 等安全验证页。"""
+    if not text:
+        return False
+
+    text_lower = text.lower()
+    challenge_signals = [
+        "just a moment",
+        "verifying you are human",
+        "performing security verification",
+        "verification successful",
+        "enable javascript and cookies to continue",
+        "performance and security by cloudflare",
+        "ray id"
+    ]
+    return sum(1 for signal in challenge_signals if signal in text_lower) >= 2
+
+
+def wait_for_challenge_resolution(page) -> str:
+    """
+    如果页面处于 challenge 状态，则在同一会话中短暂等待并重试，
+    尽量让自动验证完成后再提取正文。
+    """
+    last_text = ""
+
+    for attempt in range(3):
+        html = page.content()
+        last_text = html_to_text(html)
+        if not is_challenge_page_text(last_text):
+            return last_text
+
+        logger.warning(f"检测到验证页，等待自动验证完成（第 {attempt + 1}/3 次）")
+
+        try:
+            page.wait_for_load_state('networkidle', timeout=5000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(5000)
+
+        if attempt == 1:
+            try:
+                logger.warning("验证页仍存在，尝试刷新页面一次")
+                page.reload(wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.warning(f"刷新验证页失败（继续等待）: {e}")
+
+    return last_text
+
 def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: bool = False) -> dict:
     """
     在独立进程中运行Playwright任务
@@ -91,16 +156,20 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             
             # 如果是截图模式，跳过智能加载，使用简单等待
             if screenshot_mode:
-                logger.info("进入截图模式（跳过智能加载）...")
+                logger.info("进入截图模式（跳过智能加载，使用充分的固定等待）...")
                 
-                # 简单等待页面渲染完成
+                # 等待网络空闲(适用于动态渲染网站)
                 try:
-                    page.wait_for_load_state('load', timeout=5000)
+                    page.wait_for_load_state('networkidle', timeout=10000)
                 except Exception:
-                    pass
+                    # 如果网络一直不空闲(如持续的轮询请求)，退回等待load
+                    try:
+                        page.wait_for_load_state('load', timeout=5000)
+                    except Exception:
+                        pass
                 
-                # 短暂等待动态内容
-                page.wait_for_timeout(500)
+                # 长时间等待动态内容(从500ms增加到3000ms)
+                page.wait_for_timeout(3000)
             else:
                 # 非截图模式：使用智能页面加载检测
                 try:
@@ -172,6 +241,9 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
                         'screenshots': []
                     }
             
+            # 针对 Cloudflare 等验证页，先在同一会话中等待自动跳转
+            challenge_checked_text = wait_for_challenge_resolution(page)
+
             # 执行滚动加载
             if scroll_enabled:
                 logger.info("开始滚动加载...")
@@ -179,19 +251,11 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             
             # 获取页面源码
             content = page.content()
-            soup = BeautifulSoup(content, 'html.parser')
-            
-            # 移除脚本和样式
-            for script in soup(["script", "style", "nav", "footer", "header"]):
-                script.decompose()
-            
-            # 提取主要文本内容
-            text = soup.get_text()
-            
-            # 清理文本
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = ' '.join(chunk for chunk in chunks if chunk)
+            text = html_to_text(content)
+
+            # 如果滚动后拿到的仍然比 challenge 检测阶段更差，则保留更长的那份文本
+            if len(challenge_checked_text) > len(text):
+                text = challenge_checked_text
             
             # 关闭浏览器
             browser.close()

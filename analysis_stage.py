@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 from llm_agent import LLMAgent
 from excel_handler import validate_analysis_result
 from contact_verifier import ContactVerifier
+from direction_verifier import DirectionVerifier
 from utils import clean_email_format
 from config import ENABLE_WEB_SEARCH, PLAYWRIGHT_MCP_HEADLESS
 
@@ -40,6 +41,7 @@ class AnalysisStageManager:
             logger.info("网络搜索已禁用 (ENABLE_WEB_SEARCH=0)，跳过 MCP 初始化")
         
         self.contact_verifier = ContactVerifier(self.llm_agent, mcp_client=self.mcp_client)
+        self.direction_verifier = DirectionVerifier(self.llm_agent, mcp_client=self.mcp_client)
         self.current_row_index = None
         
     def analyze_text_complete(self, text: str, row_index: int) -> Tuple[bool, Dict, str]:
@@ -119,6 +121,11 @@ class AnalysisStageManager:
                 error_msg = "; ".join(failed_stages)
             
             logger.info(status_msg)
+            logger.info(
+                f"分析摘要: completed={completed_stages if completed_stages else ['none']}, "
+                f"failed={failed_stages if failed_stages else ['none']}, "
+                f"result_fields={sorted(final_result.keys()) if final_result else []}"
+            )
             if error_msg:
                 logger.warning(f"部分阶段失败: {error_msg}")
             
@@ -241,6 +248,14 @@ class AnalysisStageManager:
                 logger.warning(f"清理联系人验证器资源失败: {e}")
             finally:
                 self.contact_verifier = None
+                
+        if hasattr(self, 'direction_verifier') and self.direction_verifier:
+            try:
+                self.direction_verifier.cleanup()
+            except Exception as e:
+                logger.warning(f"清理方向验证器资源失败: {e}")
+            finally:
+                self.direction_verifier = None
         
         # 关闭 Playwright MCP 进程
         if hasattr(self, 'mcp_client') and self.mcp_client:
@@ -283,7 +298,17 @@ class AnalysisStageManager:
             marked_fields = [field for field in geo_fields if field in result and result[field] == "1"]
             
             if len(marked_fields) == 0:
-                return False, {}, "未标记任何专业方向，至少需要标记1个专业方向"
+                logger.info("第一遍分析未标记任何专业方向，尝试二次验证...")
+                
+                # 进入方向网络搜索和判定二次验证
+                if hasattr(self, 'direction_verifier') and self.direction_verifier:
+                    verified_fields = self.direction_verifier.verify_and_map_direction(text)
+                    if verified_fields:
+                        result.update(verified_fields)
+                        logger.info(f"阶段2通过二次验证，补充字段: {list(verified_fields.keys())}")
+                        return True, result, ""
+                
+                return False, {}, "可能不属于GIS领域"
             elif len(marked_fields) > 5:
                 return False, {}, f"标记了{len(marked_fields)}个专业方向，超过最大限制5个"
             

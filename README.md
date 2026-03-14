@@ -72,6 +72,9 @@ python main.py test
 - **Document AI**: 使用多模态LLM进行高质量文档文字提取（优先于传统OCR）
 - **截图OCR fallback**: 当常规方法失败时，自动截图并OCR识别
 - **智能重试机制**: 失败自动切换方案，多层fallback策略
+- **抓取质量评估**: 对 HTTP / Playwright / OCR 的结果统一评分，避免把模板页、门户壳页、验证页误判为成功
+- **可观测抓取日志**: 日志会记录每次尝试的方式、质量、分数、触发升级原因和最终选中的抓取方式
+- **验证页识别与等待**: 对 Cloudflare 等 challenge page 进行识别，并在同一浏览器会话内短暂等待自动验证完成
 
 ### LLM智能分析
 
@@ -126,11 +129,17 @@ main.py                      # 主入口，协调整体流程
 
 ### LLM配置
 ```python
-OPENAI_MODEL = "gpt-5-chat-latest"        # OpenAI模型
+OPENAI_PRIMARY_MODEL = "gpt-5-chat"       # OpenAI首选模型
+OPENAI_FALLBACK_MODEL = "gpt-53-chat"     # OpenAI备选模型（仅在API调用失败时启用）
 OPENAI_BASE_URL = "https://oneapi.gisphere.info/v1"  # API地址
 OLLAMA_MODEL = "qwen3:14b"                # Ollama本地模型
 OLLAMA_BASE_URL = "http://localhost:11434"
 ```
+
+说明：
+- 系统会优先调用 `OPENAI_PRIMARY_MODEL`
+- 只有当 OpenAI API 调用阶段直接失败时，才会自动切换到 `OPENAI_FALLBACK_MODEL`
+- 对 `gpt-53-chat` 会自动使用兼容参数，避免因 `max_tokens` 或 `temperature` 不兼容导致误触发 fallback
 
 ### Document AI配置
 ```python
@@ -252,6 +261,8 @@ playwright install chromium
 
 - 运行日志：`logs/run.log`
 - LLM对话记录：`llm_logs/row_xxxx_yyyymmdd_hhmmss_UTC.txt`
+- 抓取摘要：在 `logs/run.log` 中搜索 `抓取摘要`，可查看当前链接最终使用的抓取方式、质量评分和完整尝试链
+- 分析摘要：在 `logs/run.log` 中搜索 `分析摘要`，可查看三阶段分析的完成情况、失败阶段和返回字段
 
 **Q: 如何中断并恢复处理？**
 
@@ -277,6 +288,16 @@ playwright install chromium
 - ✅ 修复 `AnalysisStageManager` 清理时的 `AttributeError`
 - ✅ 升级 `openai` 依赖至 v2，解决 `proxies` 参数兼容性问题
 - ✅ 密钥文件统一移至 `keys/` 目录
+
+### v2.3 - 2026-03
+- ✅ 网页抓取改为统一策略链（HTTP -> Playwright -> OCR），不再只依赖少量站点白名单
+- ✅ 新增抓取质量评估，自动识别模板页、登录壳页、Cookie 壳页和过短内容
+- ✅ 增强运行日志，记录抓取摘要和分析摘要，便于定位具体失败步骤
+- ✅ 新增门户壳页与 Cloudflare challenge page 识别，减少 Taleo / FindAPhD 类站点的误判
+
+## 🔭 后续路线图
+
+- **方案 C（域名策略记忆）**: 在现有统一策略链基础上，为域名记录历史最优抓取方式；未来可让 `_get_web_fetch_strategy()` 根据历史质量分数动态调整起始抓取顺序，但仍保留统一 fallback 链，避免因单次误判导致策略固化。
 
 ### v2.1 - 2025-01
 - ✅ 新增 Document AI 文档提取功能（优先于传统OCR）

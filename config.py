@@ -61,7 +61,9 @@ SCREENSHOT_MAX_PAGES = 10  # 长页面最大截图页数
 SCREENSHOT_CLEANUP_AFTER_USE = True  # 使用后是否自动清理截图
 
 # LLM 配置
-OPENAI_MODEL = "gpt-5-chat"
+OPENAI_PRIMARY_MODEL = "gpt-5-chat"
+OPENAI_FALLBACK_MODEL = "gpt-53-chat"
+OPENAI_MODEL = OPENAI_PRIMARY_MODEL
 OPENAI_BASE_URL = "https://oneapi.gisphere.info/v1"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3:14b"

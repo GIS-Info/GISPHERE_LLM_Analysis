@@ -7,10 +7,11 @@ import json
 import re
 import time
 from typing import Optional, Dict, List, Tuple
+from urllib.parse import urljoin, urlparse, parse_qs, unquote
 
 from config import (REQUEST_TIMEOUT, MAX_RETRIES, CONTACT_VERIFICATION_ENABLED,
                     CONTACT_SEARCH_TIMEOUT, MAX_SEARCH_RESULTS, MAX_PAGES_TO_ANALYZE)
-from utils import normalize_text, is_valid_url
+from utils import normalize_text, is_valid_url, clean_email_format
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,282 @@ class ContactVerifier:
     # ─────────────────────────────────────────────
     #  MCP 搜索与页面获取
     # ─────────────────────────────────────────────
+
+    def _extract_search_result_url(self, raw_url: str, base_url: str = "") -> str:
+        """提取搜索结果里的真实目标 URL。"""
+        if not raw_url:
+            return ""
+
+        candidate = raw_url.strip()
+        if base_url and candidate.startswith("/"):
+            candidate = urljoin(base_url, candidate)
+
+        try:
+            parsed = urlparse(candidate)
+            query_params = parse_qs(parsed.query)
+            for key in ("uddg", "rut", "u"):
+                if key in query_params and query_params[key]:
+                    return unquote(query_params[key][0])
+        except Exception:
+            pass
+
+        return candidate
+
+    def _name_appears_relevant(self, text: str, contact_name: str) -> bool:
+        """判断结果文本里是否高概率在指向目标联系人。"""
+        if not text or not contact_name:
+            return False
+
+        haystack = text.lower()
+        clean_name = self._clean_contact_name(contact_name).lower()
+        if clean_name in haystack:
+            return True
+
+        tokens = [token for token in re.findall(r'[a-z]+', clean_name) if len(token) >= 2]
+        if len(tokens) >= 2:
+            first_name = tokens[0]
+            surname = tokens[-1]
+            if surname in haystack and first_name in haystack:
+                return True
+            if surname in haystack and f"{first_name[0]}." in haystack:
+                return True
+            if surname in haystack and f"{first_name[0]} " in haystack:
+                return True
+
+        return False
+
+    def _is_promising_profile_result(self, url: str, title: str, snippet: str,
+                                     contact_name: str, university_en: str) -> bool:
+        """
+        对白名单以外的结果做内容相关性兜底，允许明显的官方/个人主页进入后续分析。
+        """
+        combined = f"{title} {snippet}".lower()
+        if not self._name_appears_relevant(combined, contact_name):
+            return False
+
+        profile_indicators = [
+            'profile', 'profiles', 'our team', 'team', 'member', 'people',
+            'lab', 'researcher', 'assistant professor', 'professor',
+            'principal investigator', 'department', 'faculty', 'contact',
+            'email:', 'verified email'
+        ]
+        if not any(indicator in combined or indicator in url.lower() for indicator in profile_indicators):
+            return False
+
+        university_tokens = [
+            token.lower()
+            for token in re.findall(r'[A-Za-z]{3,}', university_en or '')
+            if token.lower() not in {'the', 'and', 'for', 'with'}
+        ]
+        if university_tokens and any(token in combined or token in url.lower() for token in university_tokens):
+            return True
+
+        return True
+
+    def _http_search_duckduckgo(self, query: str, contact_name: str = "",
+                                university_en: str = "") -> List[Dict]:
+        """
+        使用 DuckDuckGo HTML 结果页直接提取搜索结果。
+        这条路径比 MCP snapshot 更稳定，不依赖可访问性树结构。
+        """
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+
+            logger.info(f"HTTP DuckDuckGo搜索: {query}")
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                )
+            })
+
+            response = session.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query, "kl": "us-en", "kp": "-2"},
+                timeout=CONTACT_SEARCH_TIMEOUT
+            )
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            results = []
+
+            for block in soup.select(".result"):
+                title_node = block.select_one(".result__title a") or block.select_one("a.result__a")
+                snippet_node = block.select_one(".result__snippet")
+                if not title_node:
+                    continue
+
+                raw_url = title_node.get("href", "").strip()
+                url = self._extract_search_result_url(raw_url, "https://html.duckduckgo.com")
+                title = normalize_text(title_node.get_text(" ", strip=True))
+                snippet = normalize_text(snippet_node.get_text(" ", strip=True)) if snippet_node else ""
+
+                if not url.startswith("http"):
+                    continue
+
+                if not (
+                    self._is_useful_url(url)
+                    or self._is_promising_profile_result(url, title, snippet, contact_name, university_en)
+                ):
+                    continue
+
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet
+                })
+
+                if len(results) >= MAX_SEARCH_RESULTS:
+                    break
+
+            logger.info(f"HTTP DuckDuckGo搜索获得 {len(results)} 个有效结果")
+            return results
+
+        except Exception as e:
+            logger.warning(f"HTTP DuckDuckGo搜索失败: {e}")
+            return []
+
+    def _http_search_bing(self, query: str, contact_name: str = "",
+                          university_en: str = "") -> List[Dict]:
+        """使用 Bing 结果页作为备用搜索来源。"""
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+
+            logger.info(f"HTTP Bing搜索: {query}")
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                )
+            })
+
+            response = session.get(
+                "https://www.bing.com/search",
+                params={"q": query, "setlang": "en-US"},
+                timeout=CONTACT_SEARCH_TIMEOUT
+            )
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            results = []
+
+            for block in soup.select("li.b_algo"):
+                title_node = block.select_one("h2 a")
+                snippet_node = block.select_one(".b_caption p") or block.select_one(".b_snippet")
+                if not title_node:
+                    continue
+
+                url = self._extract_search_result_url(title_node.get("href", "").strip(), "https://www.bing.com")
+                title = normalize_text(title_node.get_text(" ", strip=True))
+                snippet = normalize_text(snippet_node.get_text(" ", strip=True)) if snippet_node else ""
+
+                if not url.startswith("http"):
+                    continue
+
+                if not (
+                    self._is_useful_url(url)
+                    or self._is_promising_profile_result(url, title, snippet, contact_name, university_en)
+                ):
+                    continue
+
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet
+                })
+
+                if len(results) >= MAX_SEARCH_RESULTS:
+                    break
+
+            logger.info(f"HTTP Bing搜索获得 {len(results)} 个有效结果")
+            return results
+
+        except Exception as e:
+            logger.warning(f"HTTP Bing搜索失败: {e}")
+            return []
+
+    def _extract_email_candidates(self, text: str) -> List[str]:
+        """从文本中提取标准或混淆写法的邮箱。"""
+        if not text:
+            return []
+
+        candidates = set()
+
+        standard_matches = re.findall(
+            r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
+            text
+        )
+        for email in standard_matches:
+            cleaned = clean_email_format(email)
+            if cleaned and '@' in cleaned:
+                candidates.add(cleaned)
+
+        spaced_standard_matches = re.findall(
+            r'[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+(?:\s*\.\s*[A-Za-z0-9.-]+)+',
+            text
+        )
+        for email in spaced_standard_matches:
+            cleaned = re.sub(r'\s+', '', email)
+            cleaned = clean_email_format(cleaned)
+            if cleaned and '@' in cleaned:
+                candidates.add(cleaned)
+
+        obfuscated_matches = re.findall(
+            r'[A-Za-z0-9._%+-]+\s*(?:\[at\]|\(at\)|\sat\s)\s*[A-Za-z0-9.-]+\s*(?:\[dot\]|\(dot\)|\sdot\s|\.)\s*[A-Za-z.]{2,}',
+            text,
+            flags=re.IGNORECASE
+        )
+        for email in obfuscated_matches:
+            cleaned = clean_email_format(email)
+            if cleaned and '@' in cleaned:
+                candidates.add(cleaned)
+
+        blocked_prefixes = ('info@', 'contact@', 'admissions@', 'webmaster@', 'privacy@', 'email@')
+        filtered = [email for email in sorted(candidates) if not email.startswith(blocked_prefixes)]
+        return filtered
+
+    def _extract_verified_email_domains(self, text: str) -> List[str]:
+        """从搜索结果摘要中提取邮箱域名线索，如 'Verified email at ucy.ac.cy'。"""
+        if not text:
+            return []
+
+        domains = set()
+        patterns = [
+            r'verified email at\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+            r'email at\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+        ]
+
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                domains.add(match.lower())
+
+        return sorted(domains)
+
+    def _search_contact_info_by_email_domain(self, contact_name: str, email_domains: List[str],
+                                             university_en: str = "") -> List[Dict]:
+        """
+        根据邮箱域名线索做定向搜索，补抓更可能带完整邮箱的官方个人页。
+        """
+        clean_name = self._clean_contact_name(contact_name)
+        results: List[Dict] = []
+
+        for domain in email_domains[:2]:
+            targeted_queries = [
+                f'{clean_name} @{domain}',
+                f'site:{domain} {clean_name} email',
+            ]
+            for query in targeted_queries:
+                results.extend(self._http_search_duckduckgo(query, contact_name, university_en))
+                if len(results) < 3:
+                    results.extend(self._http_search_bing(query, contact_name, university_en))
+
+        return results
 
     def _mcp_search(self, query: str) -> List[Dict]:
         """
@@ -214,10 +491,16 @@ Snapshot 内容：
 
         contact_name = contact_name.strip()
         has_email = contact_email and contact_email.strip() not in ['-', '', 'N/A']
+        email_needs_verification = has_email and self._is_generic_or_mismatched_email(
+            contact_email, contact_name
+        )
 
         # 第一阶段已识别 Dr. 前缀且有邮箱 → 无需验证
-        if contact_name.startswith("Dr. ") and has_email:
+        if contact_name.startswith("Dr. ") and has_email and not email_needs_verification:
             return False, "第一阶段已识别博士学位且有邮箱，无需验证"
+
+        if contact_name.startswith("Dr. ") and email_needs_verification:
+            return True, "第一阶段邮箱疑似机构通用邮箱或与联系人不匹配，需要搜索个人邮箱"
 
         # 第一阶段已识别 Dr. 但缺邮箱 → 搜索邮箱
         if contact_name.startswith("Dr. ") and not has_email:
@@ -239,8 +522,10 @@ Snapshot 内容：
         has_clear_title = any(re.search(p, original_text, re.IGNORECASE)
                               for p in title_patterns)
 
-        if has_clear_title and has_email:
+        if has_clear_title and has_email and not email_needs_verification:
             return False, "原始文本中有明确学位标识且有邮箱，无需验证"
+        elif has_clear_title and email_needs_verification:
+            return True, "原始文本中邮箱疑似机构通用邮箱或与联系人不匹配，需要搜索个人邮箱"
         elif has_clear_title and not has_email:
             return True, "原始文本中有学位标识但缺少邮箱，需要搜索邮箱"
         else:
@@ -263,11 +548,31 @@ Snapshot 内容：
 
         all_results = []
 
-        if self.mcp_client:
-            all_results = self._mcp_search(query)
-        else:
-            logger.warning("MCP 客户端不可用，无法执行网络搜索")
-            return []
+        # 1. 优先使用可直接解析的 HTML 搜索结果页，避免 snapshot 只有页面骨架。
+        all_results.extend(self._http_search_duckduckgo(query, contact_name, university_en))
+
+        # 2. 若结果不足，再补充 Bing。
+        if len(all_results) < 3:
+            all_results.extend(self._http_search_bing(query, contact_name, university_en))
+
+        # 2.5. 若已有“verified email at xxx”之类的线索，则做邮箱定向搜索，
+        #      以补抓带完整联系方式的官方个人页。
+        email_domain_hints = set()
+        for result in all_results:
+            email_domain_hints.update(self._extract_verified_email_domains(result.get('snippet', '')))
+            email_domain_hints.update(self._extract_verified_email_domains(result.get('title', '')))
+
+        if email_domain_hints:
+            logger.info(f"从搜索摘要中识别到邮箱域名线索: {sorted(email_domain_hints)}")
+            all_results.extend(
+                self._search_contact_info_by_email_domain(contact_name, sorted(email_domain_hints), university_en)
+            )
+
+        # 3. 最后再回退到 MCP snapshot 搜索。
+        if len(all_results) < 3 and self.mcp_client:
+            all_results.extend(self._mcp_search(query))
+        elif len(all_results) < 3:
+            logger.warning("MCP 客户端不可用，跳过 snapshot 搜索回退")
 
         unique_results = self._remove_duplicate_results(all_results)
         sorted_results = self._sort_results_by_priority(unique_results)
@@ -284,23 +589,54 @@ Snapshot 内容：
         """
         logger.info(f"开始分析联系人页面，共 {len(search_results)} 个结果")
 
+        result_map = {r['url']: r for r in search_results if r.get('url')}
+
         # 用 LLM 选择最相关的页面 URL
         if len(search_results) > 1:
             selected_urls = self._select_relevant_pages(search_results, contact_name)
         else:
             selected_urls = [r['url'] for r in search_results]
 
+        # 不完全依赖 LLM 选择，额外补入若干高优先级官方个人页，
+        # 确保真正可能包含联系方式的页面也会被检查。
+        fallback_urls = [r['url'] for r in self._sort_results_by_priority(search_results)]
+        merged_urls = []
+        for url in selected_urls + fallback_urls:
+            if url and url not in merged_urls:
+                merged_urls.append(url)
+
         best_pages = []
-        for url in selected_urls[:MAX_PAGES_TO_ANALYZE]:
+        max_candidate_pages = max(MAX_PAGES_TO_ANALYZE, 8)
+        for url in merged_urls[:max_candidate_pages]:
             try:
                 page_content = self._fetch_page_content(url)
                 if page_content:
+                    result_info = result_map.get(url, {})
+                    snippet_text = result_info.get('snippet', '')
+                    title_text = result_info.get('title', '')
+
+                    direct_emails = self._extract_email_candidates(
+                        "\n".join([title_text, snippet_text, page_content])
+                    )
+
                     analysis = self._analyze_page_with_llm(page_content, contact_name)
                     if analysis:
+                        llm_email = clean_email_format(analysis.get('email_address', '') or '')
+                        if llm_email and self._is_generic_or_mismatched_email(llm_email, contact_name) and not direct_emails:
+                            analysis['email_address'] = ""
+
+                        if direct_emails and not analysis.get('email_address'):
+                            analysis['email_address'] = direct_emails[0]
+                            evidence = analysis.get('evidence', '')
+                            analysis['evidence'] = (
+                                f"{evidence} Direct email extraction: {direct_emails[0]}".strip()
+                            )
+
                         best_pages.append({
                             'url': url,
                             'analysis': analysis,
-                            'content': page_content[:2000]
+                            'content': page_content[:2000],
+                            'snippet': snippet_text
                         })
             except Exception as e:
                 logger.warning(f"分析页面失败 {url}: {e}")
@@ -373,7 +709,11 @@ Snapshot 内容：
 
             # 更新邮箱（仅在原本无邮箱时填入）
             if found_email:
-                if not contact_email or contact_email.strip() in ['-', '', 'N/A']:
+                if (
+                    not contact_email
+                    or contact_email.strip() in ['-', '', 'N/A']
+                    or self._is_generic_or_mismatched_email(contact_email, contact_name)
+                ):
                     result['Contact_Email'] = found_email
 
             result['verification_details'] = explanation
@@ -444,6 +784,39 @@ Snapshot 内容：
         else:
             return clean_name
 
+    def _is_generic_or_mismatched_email(self, contact_email: str, contact_name: str) -> bool:
+        """判断邮箱是否更像机构通用邮箱，而不是联系人个人邮箱。"""
+        if not contact_email or contact_email.strip() in ['-', '', 'N/A']:
+            return False
+
+        email = clean_email_format(contact_email).lower()
+        if '@' not in email:
+            return True
+
+        local_part = email.split('@', 1)[0]
+        generic_locals = {
+            'info', 'contact', 'admissions', 'admission', 'admin', 'office',
+            'support', 'help', 'service', 'services', 'enquiries', 'enquiry',
+            'apply', 'application', 'applications', 'jobs', 'career', 'careers',
+            'hr', 'hello', 'mail', 'kios', 'email', 'grad'
+        }
+        if local_part in generic_locals:
+            return True
+
+        clean_name = self._clean_contact_name(contact_name).lower()
+        name_tokens = [token for token in re.findall(r'[a-z]+', clean_name) if len(token) >= 3]
+        if not name_tokens:
+            return False
+
+        # 个人邮箱通常会包含姓、名的一部分，或首字母+姓。
+        if any(token in local_part for token in name_tokens):
+            return False
+        surname = name_tokens[-1]
+        if len(name_tokens) >= 2 and f"{name_tokens[0][0]}{surname}" in local_part:
+            return False
+
+        return True
+
     def _remove_duplicate_results(self, results: List[Dict]) -> List[Dict]:
         """移除重复的搜索结果"""
         seen_urls = set()
@@ -466,10 +839,22 @@ Snapshot 内容：
                 if domain in url:
                     score += (len(self.priority_domains) - i) * 10
                     break
+            # 官方大学个人页通常最容易拿到邮箱，优先级高于纯学术索引页
+            for ind in ['/people/', '/profile/', '/directory/', '/staff/', '/faculty/', '/person/']:
+                if ind in url:
+                    score += 18
+            if any(host in url for host in ['kios.ucy.ac.cy', 'ucy.ac.cy']):
+                score += 15
+            # 搜索摘要里直接出现邮箱时，优先分析该结果
+            if self._extract_email_candidates(" ".join([title, snippet])):
+                score += 100
+            # 社交平台和动态流通常不直接给出可靠联系方式，适度降权
+            if any(host in url for host in ['linkedin.com', 'x.com', 'twitter.com']):
+                score -= 20
             for kw in ['professor', 'dr.', 'phd', 'faculty', 'researcher', 'scholar']:
                 if kw in title or kw in snippet:
                     score += 5
-            for ind in ['homepage', 'profile', 'bio', 'cv', 'resume']:
+            for ind in ['homepage', 'profile', 'bio', 'cv', 'resume', 'contact', 'directory']:
                 if ind in url or ind in title:
                     score += 3
             return score
@@ -551,6 +936,12 @@ STRICT SELECTION RULES:
   2. Personal academic homepage hosted on a university server
   3. Academic platforms: Google Scholar, ResearchGate, ORCID, Academia.edu, Semantic Scholar
   4. Official lab or research group pages listing the person
+
+EMAIL PRIORITY RULE:
+- If the goal includes finding a contact email, strongly prefer official university / lab / personal profile pages
+  that are likely to list contact details directly.
+- Use Google Scholar / ORCID / ResearchGate as supporting sources, but not ahead of an official profile page when
+  an official page for the same person is present.
 
 ❌ FORBIDDEN page types (never select these):
   - Job boards or recruitment sites (LinkedIn Jobs, Indeed, Glassdoor, etc.)
@@ -660,7 +1051,12 @@ Important notes:
             return "Mr./Ms.", "", "页面分析失败"
 
         has_doctorate_count = sum(1 for a in all_analyses if a.get('has_doctorate', False))
-        emails = [a.get('email_address') for a in all_analyses if a.get('email_address')]
+        emails = [
+            clean_email_format(a.get('email_address'))
+            for a in all_analyses
+            if a.get('email_address')
+            and not self._is_generic_or_mismatched_email(a.get('email_address'), contact_name)
+        ]
         genders = [a.get('gender') for a in all_analyses
                    if a.get('gender') and a.get('gender') != 'unknown']
 

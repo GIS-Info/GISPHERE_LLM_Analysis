@@ -4,14 +4,23 @@ LLM调用模块，支持OpenAI API和Ollama本地模型
 import json
 import logging
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import time
 from datetime import datetime
 
-from config import OPENAI_MODEL, OPENAI_BASE_URL, OLLAMA_BASE_URL, OLLAMA_MODEL, check_openai_key
+from config import (
+    OPENAI_MODEL,
+    OPENAI_PRIMARY_MODEL,
+    OPENAI_FALLBACK_MODEL,
+    OPENAI_BASE_URL,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
+    check_openai_key,
+)
 from utils import validate_json_response, save_llm_conversation, check_ollama_availability
 
 logger = logging.getLogger(__name__)
+OPENAI_STRICT_PARAM_MODEL = "gpt-53-chat"
 
 class LLMAgent:
     def __init__(self):
@@ -19,6 +28,7 @@ class LLMAgent:
         self.openai_client = None
         self.conversation_history = []
         self.conversation_saved = False  # 添加标志位，避免重复保存
+        self.last_used_model = None
         
         # 检查LLM可用性
         self._initialize_llm()
@@ -35,6 +45,7 @@ class LLMAgent:
                     base_url=OPENAI_BASE_URL
                 )
                 self.use_openai = True
+                self.last_used_model = OPENAI_PRIMARY_MODEL
                 logger.info(f"✅ OpenAI API 初始化成功 (Base URL: {OPENAI_BASE_URL})")
                 return
             except Exception as e:
@@ -104,31 +115,63 @@ class LLMAgent:
     
     def _call_openai(self, prompt: str, system_prompt: str = None) -> Optional[str]:
         """调用OpenAI API"""
-        try:
-            messages = []
-            
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            
-            messages.append({"role": "user", "content": prompt})
-            
-            logger.info("调用OpenAI API...")
-            
-            response = self.openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=3000
-            )
-            
-            result = response.choices[0].message.content
-            
-            logger.info("OpenAI API调用成功")
-            return result
-            
-        except Exception as e:
-            logger.error(f"OpenAI API调用失败: {e}")
-            return None
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        messages.append({"role": "user", "content": prompt})
+
+        models_to_try: List[str] = [OPENAI_PRIMARY_MODEL]
+        if OPENAI_FALLBACK_MODEL and OPENAI_FALLBACK_MODEL != OPENAI_PRIMARY_MODEL:
+            models_to_try.append(OPENAI_FALLBACK_MODEL)
+
+        last_error = None
+
+        for idx, model_name in enumerate(models_to_try):
+            is_fallback = idx > 0
+            try:
+                if is_fallback:
+                    logger.warning(
+                        f"OpenAI 主模型调用失败，切换到备选模型: {model_name}"
+                    )
+                else:
+                    logger.info(f"调用OpenAI API，首选模型: {model_name}")
+
+                request_kwargs = {
+                    "model": model_name,
+                    "messages": messages,
+                }
+
+                # `gpt-53-chat` 当前网关对部分参数更严格：
+                # - 需要 `max_completion_tokens`
+                # - 仅支持默认 temperature，因此不显式传递
+                if model_name == OPENAI_STRICT_PARAM_MODEL:
+                    request_kwargs["max_completion_tokens"] = 3000
+                else:
+                    request_kwargs["temperature"] = 0.1
+                    request_kwargs["max_tokens"] = 3000
+
+                response = self.openai_client.chat.completions.create(
+                    **request_kwargs
+                )
+
+                result = response.choices[0].message.content
+                self.last_used_model = model_name
+
+                if is_fallback:
+                    logger.info(f"OpenAI API调用成功（使用备选模型: {model_name}）")
+                else:
+                    logger.info(f"OpenAI API调用成功（使用主模型: {model_name}）")
+
+                return result
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"OpenAI API调用失败（模型: {model_name}）: {e}")
+
+        logger.error(f"OpenAI 主备模型均调用失败: {last_error}")
+        return None
     
     def _call_ollama(self, prompt: str, system_prompt: str = None) -> Optional[str]:
         """调用Ollama本地模型"""
@@ -198,7 +241,16 @@ CRITICAL RULE:
      * If the month/day has not yet passed this year, assume it refers to this year ({current_year})
 2. "Number_Places": Extract ONLY the number of positions that is explicitly stated. For academic positions (Master, PhD, PostDoc, Research Assistant), specify the exact number if mentioned. If there are multiple positions, the number should be added up. If not specified, should fill in "1". For events (Competition, Summer School, Conference, Workshop), leave empty.
 3. "Direction": Extract ONLY the research direction or project topic that is stated in the text. If not explicitly stated, summarize ONLY from the actual content provided. Please make sure that the first letter of the first word and special nouns are capitalized, and the others are lowercase.For example, “PhD Position: Using AI for Pandemic Preparedness and Building Resilient Healthcare Systems (PARAATHEID)” should be converted to “Using AI for pandemic preparedness and building resilient healthcare systems”.
-4. "University_EN": Extract ONLY the full English name of the university/institution that is EXPLICITLY mentioned. If the abbreviation of the school/institution is used in the text, use it after completing it. If not specified or uncertain, leave empty.
+4. "University_EN": Extract the top-level full official English name of the university/institution. Prefer the parent university over any school, college, faculty, department, center, institute, laboratory, hospital, or other sub-unit. If the source text uses a non-English local-language institution name, convert it to the institution's standard official English name when that mapping is clear and unambiguous. Do NOT append any abbreviation, acronym, short form, or alias in parentheses, after commas, or anywhere else. If the text provides both a full name and an abbreviation, return only the full name without the abbreviation. If the text provides only an abbreviation/acronym and the full name is not explicitly given, leave empty.
+   - If a posting is issued by a sub-unit of a university, return the university name, not the sub-unit name.
+   - If the page mentions a school/college/faculty/department/center/lab that clearly belongs to a university, normalize it to the university's full official name.
+   - Correct: "Helmholtz Centre for Environmental Research"
+   - Wrong: "Helmholtz Centre for Environmental Research (UFZ)"
+   - Wrong: "Helmholtz Centre for Environmental Research, UFZ"
+   - Correct: "Harvard University"
+   - Wrong: "Harvard Chan School of Public Health"
+   - Correct: "Paris-Saclay University"
+   - Wrong: "Université Paris-Saclay"
 5. "Contact_Name": Extract ONLY the contact person's name that is EXPLICITLY provided in the text (usually the project leader, proposer, or professor, etc.). If multiple contacts, choose the first one. If NO contact is provided, use "-".
    CRITICAL FORMATTING RULES:
    - ONLY use these exact prefixes: "Dr. ", "Mr. ", "Ms. " or NO prefix at all
@@ -412,7 +464,7 @@ IMPORTANT: Analyze the actual text content to determine which categories apply. 
             "prompt": prompt,
             "response": response,
             "original_text": original_text,  # 添加原始文本内容
-            "model": OPENAI_MODEL if self.use_openai else OLLAMA_MODEL
+            "model": self.last_used_model if self.use_openai else OLLAMA_MODEL
         }
         self.conversation_history.append(conversation)
         logger.info(f"已记录{stage}阶段对话")
@@ -438,7 +490,7 @@ IMPORTANT: Analyze the actual text content to determine which categories apply. 
         """获取当前使用的模型信息"""
         return {
             "use_openai": self.use_openai,
-            "model": OPENAI_MODEL if self.use_openai else OLLAMA_MODEL,
+            "model": self.last_used_model if self.use_openai else OLLAMA_MODEL,
             "api_url": OPENAI_BASE_URL if self.use_openai else OLLAMA_BASE_URL
         }
 

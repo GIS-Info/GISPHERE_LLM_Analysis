@@ -46,6 +46,34 @@ def check_dependencies():
     logger.info("所有依赖包检查完成")
     return True
 
+def is_third_party_url(url):
+    """检查URL是否为第三方平台网址（非官方独立网站）"""
+    if not url:
+        return False
+        
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # 常见的第三方平台域名关键字
+        third_party_domains = [
+            'linkedin.com', 'twitter.com', 'x.com', 
+            'zhihu.com', 'xiaohongshu.com', 'weibo.com', 
+            'facebook.com', 'instagram.com', 'github.com',
+            'weixin.qq.com', 'mp.weixin.qq.com', 'wechat.com',
+            'findaphd.com', 'researchgate.net', 'google.com',
+            'medium.com', 'scholar.google.com', 'phdportal.com',
+            'mastersportal.com', 'zhuanlan.zhihu.com'
+        ]
+        
+        for tp_domain in third_party_domains:
+            if tp_domain in domain:
+                return True
+                
+        return False
+    except Exception:
+        return False
+
 def is_valid_url(text):
     """检查文本是否为有效的URL"""
     if not text or not isinstance(text, str):

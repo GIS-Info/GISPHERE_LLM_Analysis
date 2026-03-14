@@ -189,7 +189,9 @@ class LLMAnalysisSystem:
             # 3. 获取内容
             logger.info(f"获取内容: {url}")
             content = self.content_fetcher.fetch_content(url)
+            fetch_summary = self.content_fetcher.get_last_fetch_summary()
             if not content:
+                logger.error(f"抓取摘要: {fetch_summary}")
                 error_msg = "内容获取失败"
                 logger.error(error_msg)
                 self.excel_handler.update_row_error(row_index, error_msg)
@@ -198,21 +200,45 @@ class LLMAnalysisSystem:
                 return False
             
             logger.info(f"内容获取成功，长度: {len(content)} 字符")
+            if fetch_summary:
+                attempt_chain = " -> ".join(
+                    f"{attempt['method']}[{attempt['quality']}:{attempt['score']}]"
+                    for attempt in fetch_summary.get("attempts", [])
+                )
+                logger.info(
+                    "抓取摘要: "
+                    f"selected_method={fetch_summary.get('selected_method')}, "
+                    f"status={fetch_summary.get('final_status')}, "
+                    f"quality={fetch_summary.get('selected_quality')}, "
+                    f"score={fetch_summary.get('selected_score')}, "
+                    f"reason={fetch_summary.get('selected_reason')}, "
+                    f"attempts={attempt_chain or 'special-flow'}"
+                )
             
             # 4. 分析内容
             logger.info("开始LLM分析...")
             has_results, results, error_msg = self.analysis_manager.analyze_text_complete(content, row_index)
+            
+            # 检查是否为第三方网址
+            final_error_msg = error_msg if error_msg else ""
+            if not used_notes:
+                from utils import is_third_party_url
+                if is_third_party_url(url):
+                    if final_error_msg:
+                        final_error_msg = f"{final_error_msg}; 可能是第三方网址"
+                    else:
+                        final_error_msg = "可能是第三方网址"
+                    logger.info(f"提取自Source的链接识别为第三方平台，将在Error列中添加'可能是第三方网址'")
             
             # 处理分析结果
             if has_results:
                 # 有结果（完全成功或部分成功）
                 logger.info(f"分析获得结果，更新数据...")
                 
-                # 5. 根据是否有错误决定Verifier字段
+                # 5. 根据是否有错误决定Verifier字段 (根据最初的error_msg判断)
                 verifier = "LLM" if not error_msg else ""  # 只有完全成功才设置Verifier为LLM
                 
                 # 6. 如果使用了Notes中的链接且Verifier设置为LLM，需要在Error列中填写"需转换链接"
-                final_error_msg = error_msg
                 if used_notes and verifier == "LLM":
                     if final_error_msg:
                         final_error_msg = f"{final_error_msg}; 需转换链接"
@@ -231,14 +257,14 @@ class LLMAnalysisSystem:
                     return False
                 
                 if final_error_msg:
-                    logger.info(f"第 {row_index} 行部分成功（Verifier未设置，Error列记录失败信息）")
+                    logger.info(f"第 {row_index} 行部分成功（Error列记录了信息）")
                 else:
                     logger.info(f"第 {row_index} 行完全成功（Verifier设置为LLM）")
                 
             else:
                 # 没有任何结果（完全失败）
-                logger.error(f"分析完全失败: {error_msg}")
-                self.excel_handler.update_row_error(row_index, error_msg)
+                logger.error(f"分析完全失败: {final_error_msg}")
+                self.excel_handler.update_row_error(row_index, final_error_msg)
                 # 如果处理的是PDF文件，删除缓存的PDF文件
                 self.content_fetcher.delete_current_pdf()
                 return False
