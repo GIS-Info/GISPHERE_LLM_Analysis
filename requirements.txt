@@ -1,51 +1,63 @@
-# ============================================
-# 基于LLM的文本智能分析与数据字段自动填写系统
-# Python依赖清单
-# ============================================
+# =============================================================================
+# LLM Analysis — Python dependencies
+#
+# Install:
+#   python -m pip install -r requirements.txt
+#   python -m playwright install chromium
+#
+# System tools (NOT installed via pip — see README):
+#   - Node.js + npx          MCP contact/direction search (npx @playwright/mcp)
+#   - Tesseract OCR          pytesseract fallback; need eng + chi_sim language packs
+#   - Playwright Chromium    installed by command above
+#
+# Optional:
+#   - opencv-python          OCR image preprocessing (auto-skipped if missing)
+#   - Ollama                 local LLM fallback when no API key
+# =============================================================================
 
-# Core - LLM调用
-openai>=2.0.0
+# Core HTTP/API (New API gateway via requests; no openai SDK)
 requests>=2.31.0
 urllib3>=2.0.0
 
-# Data processing - 数据处理
+# Data processing
 pandas>=2.0.0
 numpy>=1.24.0
 openpyxl>=3.1.0
 
-# Web scraping and parsing - 网页抓取与解析
+# Web scraping and main-content extraction
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+trafilatura>=1.8.0
+lxml_html_clean>=0.1.0
 
-# Progress bar - 进度条
+# Progress
 tqdm>=4.66.0
 
-# PDF processing - PDF处理
-PyMuPDF>=1.23.0       # fitz, 主要PDF解析库
-pdfplumber>=0.9.0     # PDF文字提取备选
-PyPDF2>=3.0.0         # PDF文字提取备选
+# PDF processing
+PyMuPDF>=1.23.0
+pdfplumber>=0.9.0
+PyPDF2>=3.0.0
 
-# OCR - 文字识别
+# OCR and images
 pytesseract>=0.3.10
 Pillow>=10.0.0
 
-# Browser automation - 浏览器自动化（内容获取 + 联系人验证搜索）
+# Browser automation (dynamic pages, PDF viewers, Playwright worker)
 playwright>=1.40.0
 
-# MCP client - Playwright MCP客户端（联系人验证DuckDuckGo搜索）
-mcp>=1.0.0
+# MCP client (Playwright MCP — requires Node.js npx at runtime)
+mcp>=1.9.0
 
-# Google Sheets API - Google表格API
+# Google Sheets API
 google-api-python-client>=2.117.0
 google-auth-httplib2>=0.1.0
 google-auth-oauthlib>=1.0.0
 google-auth>=2.17.0
 
-# Text processing - 文本处理
+# Text processing (Sheets label inflection, etc.)
 inflect>=6.0.0
 
-# ============================================
-# Optional but highly recommended for better OCR quality
-# 可选依赖 - 强烈推荐安装以提高OCR质量
-# ============================================
+# -----------------------------------------------------------------------------
+# Optional — OCR image preprocessing; skipped automatically if not installed
+# -----------------------------------------------------------------------------
 # opencv-python>=4.8.0

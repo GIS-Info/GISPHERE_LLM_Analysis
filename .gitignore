@@ -1,0 +1,24 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Local editor and AI assistant state
+.claude/
+
+# Runtime outputs
+logs/
+llm_logs/
+cache/
+
+# Local secrets and auth artifacts
+keys/
+
+# Local data file
+text_info.xlsx
+
+# Local probe / test artifacts
+_feas/
+_shot*/
+_li_test*/
+_ocr_sample.png
+.playwright-mcp/

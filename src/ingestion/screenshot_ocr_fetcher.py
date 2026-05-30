@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, List
 import io
 
-from config import USE_DOCUMENT_AI
+from ..core.config import USE_DOCUMENT_AI
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class ScreenshotOCRFetcher:
             return False
         
         try:
-            from document_ai import get_document_ai_extractor
+            from .document_ai import get_document_ai_extractor
             extractor = get_document_ai_extractor()
             return extractor.is_available
         except ImportError:
@@ -124,7 +124,7 @@ class ScreenshotOCRFetcher:
     def _extract_with_document_ai(self, screenshot_paths: List[str]) -> Optional[str]:
         """使用 Document AI 从截图中提取文本"""
         try:
-            from document_ai import get_document_ai_extractor
+            from .document_ai import get_document_ai_extractor
             
             extractor = get_document_ai_extractor()
             if not extractor.is_available:
@@ -142,7 +142,7 @@ class ScreenshotOCRFetcher:
         try:
             import pytesseract
             from PIL import Image
-            from config import OCR_LANGUAGE, SCREENSHOT_CLEANUP_AFTER_USE
+            from ..core.config import OCR_LANGUAGE, SCREENSHOT_CLEANUP_AFTER_USE
             import os
             import platform
             
@@ -226,7 +226,7 @@ class ScreenshotOCRFetcher:
     
     def _cleanup_screenshots(self, screenshot_paths: List[str]) -> None:
         """清理截图文件"""
-        from config import SCREENSHOT_CLEANUP_AFTER_USE
+        from ..core.config import SCREENSHOT_CLEANUP_AFTER_USE
         
         if not SCREENSHOT_CLEANUP_AFTER_USE:
             return
@@ -311,7 +311,7 @@ class ScreenshotOCRFetcher:
         
         # 移除多余空白
         import re
-        from utils import normalize_text
+        from ..core.utils import normalize_text
         
         # 定义要过滤的UI元素关键词（常见的PDF查看器/编辑器UI文本）
         ui_keywords = [
@@ -322,15 +322,16 @@ class ScreenshotOCRFetcher:
             'annotation', 'highlight', 'comment', 'save', 'export', 'upload'
         ]
         
-        # 移除包含UI关键词的行
+        # 移除纯UI行。弱化策略：仅当"整行"就是某个UI关键词时才删除，
+        # 避免误删正文（例如正文中含 edit/print/share 等普通词的句子）。
         lines = text.split('\n')
         filtered_lines = []
         for line in lines:
             line_lower = line.lower().strip()
-            # 检查是否包含UI关键词
-            is_ui_text = any(keyword in line_lower for keyword in ui_keywords)
-            # 检查是否是单个图标字符或很短的UI文本
-            is_short_ui = len(line_lower) <= 2 or (len(line_lower) <= 5 and not any(c.isdigit() for c in line))
+            # 整行精确匹配 UI 关键词才视为 UI 文本
+            is_ui_text = line_lower in ui_keywords
+            # 仅过滤极短的杂散字符（单字符/空行），不再按 5 字符 + 无数字粗暴删除
+            is_short_ui = len(line_lower) <= 1
             
             if not is_ui_text and not is_short_ui:
                 filtered_lines.append(line)
@@ -343,13 +344,14 @@ class ScreenshotOCRFetcher:
         # 标准化文本
         text = normalize_text(text)
         
-        # 移除过短的行（可能是OCR错误）
+        # 移除过短的行（可能是OCR错误）。弱化策略：改用中性长度阈值，
+        # 不再依赖学术关键词白名单，避免漏掉非学术正文（如数字、地名、短标题）。
         lines = text.split('\n')
         cleaned_lines = []
         for line in lines:
             line = line.strip()
-            # 保留长度大于5的行，或者包含常见关键词的行
-            if len(line) > 5 or any(keyword in line.lower() for keyword in ['phd', 'university', 'email', 'deadline', 'position', 'research', 'doctor']):
+            # 保留长度 >= 3 的行；更短的行多为 OCR 噪点
+            if len(line) >= 3:
                 cleaned_lines.append(line)
         
         # 移除中文字符之间的多余空格
@@ -399,4 +401,7 @@ class ScreenshotOCRFetcher:
         
         logger.info(f"OCR文本质量验证通过: 长度 {len(text)} 字符, 关键词 {keyword_count} 个")
         return True
+
+
+
 

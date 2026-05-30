@@ -1,4 +1,4 @@
-"""
+﻿"""
 LLM调用模块，支持OpenAI API和Ollama本地模型
 """
 import json
@@ -8,19 +8,18 @@ from typing import Optional, Dict, Any, List
 import time
 from datetime import datetime
 
-from config import (
+from .config import (
     OPENAI_MODEL,
     OPENAI_PRIMARY_MODEL,
-    OPENAI_FALLBACK_MODEL,
     OPENAI_BASE_URL,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     check_openai_key,
 )
-from utils import validate_json_response, save_llm_conversation, check_ollama_availability
+from .api_client import NewAPIClient
+from .utils import validate_json_response, save_llm_conversation, check_ollama_availability
 
 logger = logging.getLogger(__name__)
-OPENAI_STRICT_PARAM_MODEL = "gpt-53-chat"
 
 class LLMAgent:
     def __init__(self):
@@ -35,21 +34,16 @@ class LLMAgent:
     
     def _initialize_llm(self):
         """初始化LLM"""
-        # 优先尝试OpenAI
-        openai_key = check_openai_key()
-        if openai_key:
+        # 优先尝试 New API（OpenAI-compatible gateway）
+        if check_openai_key():
             try:
-                import openai
-                self.openai_client = openai.OpenAI(
-                    api_key=openai_key,
-                    base_url=OPENAI_BASE_URL
-                )
+                self.openai_client = NewAPIClient()
                 self.use_openai = True
                 self.last_used_model = OPENAI_PRIMARY_MODEL
-                logger.info(f"✅ OpenAI API 初始化成功 (Base URL: {OPENAI_BASE_URL})")
+                logger.info(f"✅ New API 初始化成功 (Base URL: {OPENAI_BASE_URL})")
                 return
             except Exception as e:
-                logger.warning(f"OpenAI API 初始化失败: {e}")
+                logger.warning(f"New API 初始化失败: {e}")
         
         # 尝试Ollama
         if check_ollama_availability():
@@ -114,64 +108,27 @@ class LLMAgent:
             return None
     
     def _call_openai(self, prompt: str, system_prompt: str = None) -> Optional[str]:
-        """调用OpenAI API"""
-        messages = []
-        
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        
-        messages.append({"role": "user", "content": prompt})
+        """调用 New API /chat/completions，按 TEXT_MODEL_CHAIN 价格升序回退。"""
+        combined_prompt = f"{system_prompt or ''}\n{prompt}".lower()
+        try:
+            result = self.openai_client.complete_text(
+                prompt=prompt,
+                instructions=system_prompt,
+                max_output_tokens=3000,
+                temperature=0.1,
+                json_mode="json" in combined_prompt,
+            )
+        except Exception as e:
+            logger.error(f"New API 文本调用异常: {e}")
+            return None
 
-        models_to_try: List[str] = [OPENAI_PRIMARY_MODEL]
-        if OPENAI_FALLBACK_MODEL and OPENAI_FALLBACK_MODEL != OPENAI_PRIMARY_MODEL:
-            models_to_try.append(OPENAI_FALLBACK_MODEL)
+        if result is None:
+            logger.error("New API 模型链全部调用失败")
+            return None
 
-        last_error = None
-
-        for idx, model_name in enumerate(models_to_try):
-            is_fallback = idx > 0
-            try:
-                if is_fallback:
-                    logger.warning(
-                        f"OpenAI 主模型调用失败，切换到备选模型: {model_name}"
-                    )
-                else:
-                    logger.info(f"调用OpenAI API，首选模型: {model_name}")
-
-                request_kwargs = {
-                    "model": model_name,
-                    "messages": messages,
-                }
-
-                # `gpt-53-chat` 当前网关对部分参数更严格：
-                # - 需要 `max_completion_tokens`
-                # - 仅支持默认 temperature，因此不显式传递
-                if model_name == OPENAI_STRICT_PARAM_MODEL:
-                    request_kwargs["max_completion_tokens"] = 3000
-                else:
-                    request_kwargs["temperature"] = 0.1
-                    request_kwargs["max_tokens"] = 3000
-
-                response = self.openai_client.chat.completions.create(
-                    **request_kwargs
-                )
-
-                result = response.choices[0].message.content
-                self.last_used_model = model_name
-
-                if is_fallback:
-                    logger.info(f"OpenAI API调用成功（使用备选模型: {model_name}）")
-                else:
-                    logger.info(f"OpenAI API调用成功（使用主模型: {model_name}）")
-
-                return result
-
-            except Exception as e:
-                last_error = e
-                logger.error(f"OpenAI API调用失败（模型: {model_name}）: {e}")
-
-        logger.error(f"OpenAI 主备模型均调用失败: {last_error}")
-        return None
+        # 记录实际成功使用的模型
+        self.last_used_model = getattr(self.openai_client, "last_model", None) or OPENAI_PRIMARY_MODEL
+        return result
     
     def _call_ollama(self, prompt: str, system_prompt: str = None) -> Optional[str]:
         """调用Ollama本地模型"""
@@ -327,7 +284,7 @@ CATEGORIZATION INSTRUCTIONS:
 CRITICAL RULE: 
 - You MUST ONLY categorize based on information that is stated in the provided text. 
 - IMPORTANT: ONLY include fields with value "1" in your response. DO NOT include fields that don't apply.
-- You must mark at least 1 and at most 5 Research Fields.
+- You must mark at least 1 and at most 3 Research Fields.
 
 Position Types (mark "1" if mentioned, DO NOT include in response if not applicable):
 - "Master Student": Master's degree students
@@ -545,3 +502,6 @@ if __name__ == "__main__":
     # 设置日志
     logging.basicConfig(level=logging.INFO)
     test_llm_agent() 
+
+
+

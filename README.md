@@ -1,335 +1,339 @@
-# 基于LLM的文本智能分析与数据字段自动填写系统
+# 基于LLM的学术机会信息智能分析系统
 
-这是一个智能的文本分析系统，能够自动从网页或PDF链接中提取内容，通过大语言模型(LLM)进行三阶段分析，并将结果自动填入Excel表格或Google Sheets的相应字段中。
+这是一个批量化的智能文本分析系统，能够从网页、PDF、截图、本地 Excel 以及 Google Sheets 中提取学术机会信息。系统自动获取来源内容，通过大语言模型(LLM)进行三阶段分析，对关键字段进行校验，并将结构化结果自动写回数据表。
 
 ## 🚀 快速开始
 
 ### 环境要求
 
-- **Python**: 3.8+
-- **必需依赖**: 见 `requirements.txt`
-- **外部工具**:
-  - **Tesseract OCR**: 截图文字识别引擎（可选，用于OCR fallback）
-  - **Playwright浏览器**: Chromium浏览器（用于动态网页加载 + 联系人验证搜索）
+- **Python**: 推荐 3.10+
+- **New API 网关**: `https://newapi.gisphere.info/v1`
+- **Python 依赖**: 见 [`requirements.txt`](requirements.txt)（含 `trafilatura`、`lxml_html_clean` 等；**无需** `openai` SDK，LLM 调用走 `requests`）
+- **系统工具**（不通过 pip 安装，需单独配置）:
+  - **Node.js + npx**: 联系人/方向验证的 Playwright MCP 依赖 `npx @playwright/mcp`（见 `analysis_stage.py`）
+  - **Tesseract OCR**: `pytesseract` 回退路径；需安装 **`eng` + `chi_sim`** 语言包（与 `OCR_LANGUAGE = 'eng+chi_sim'` 一致）
+  - **Playwright Chromium**: 动态网页、PDF 预览器截图
+- **可选**: Ollama 本地模型（无 API Key 时回退）；`opencv-python`（OCR 图像预处理，未安装时自动跳过）
 
 ### 安装步骤
 
 ```bash
-# 1. 克隆项目
-git clone [项目地址]
-cd LLM_Analysis
-
-# 2. 安装Python依赖
-pip install -r requirements.txt
-
-# 3. 安装Playwright浏览器
-playwright install chromium
-
-# 4. 可选：安装opencv-python以获得更好的OCR效果
-pip install opencv-python
+python -m pip install -r requirements.txt
+python -m playwright install chromium
 ```
+
+安装完成后建议先运行系统自检（见下方「运行」）。
 
 ### 配置
 
-#### 配置LLM服务
+#### 配置 LLM 服务
 
-在 `keys/openai_key.txt` 中添加API密钥：
-```bash
-echo "your-api-key-here" > keys/openai_key.txt
+在 `keys/api_key.txt` 中写入 API 密钥（单行）：
+
+```text
+your-api-key-here
 ```
 
-或使用Ollama本地模型：
-```bash
-ollama serve
-ollama pull qwen3:14b
-```
+> 若 `api_key.txt` 不存在，程序仍兼容旧的 `keys/openai_key.txt` 文件名。
 
 #### 配置数据源
 
-**Google Sheets模式**：
-1. 配置 `keys/credentials.json`（Google API凭据）
-2. 在 `config.py` 中设置 `GOOGLE_SPREADSHEET_ID`
+**Google Sheets 模式**：
 
-**本地Excel模式**：
-- 将数据放入 `text_info.xlsx` 的 `Unfilled` 工作表
+1. 将 Google API 凭据放在 `keys/credentials.json`
+2. 在 `src/core/config.py` 中设置 `GOOGLE_SPREADSHEET_ID`
+3. **首次连接**会弹出浏览器 OAuth 授权，成功后生成 `keys/token.pickle`（已 gitignore，勿提交）
+
+**本地 Excel 模式**：若缺少 Google 凭据，程序自动回退，读取项目根目录的 `text_info.xlsx`（工作表 `Unfilled`）。
 
 ### 运行
 
 ```bash
+# 系统自检（推荐首次运行前执行）
+python -m src.tools.check_system
+
 # 处理所有未填写的行
 python main.py
 
 # 测试单行处理
 python main.py test
+
+# 手动刷新模型清单
+python -m src.tools.update_models
 ```
 
 ## 🌟 主要特性
 
 ### 内容提取能力
 
-- **智能页面加载**: 四重策略检测（网络空闲、关键元素、内容稳定性、高度稳定性）
-- **多种获取方式**: HTTP请求、Playwright动态渲染、PDF下载、Google Drive/Docs处理
-- **Document AI**: 使用多模态LLM进行高质量文档文字提取（优先于传统OCR）
-- **截图OCR fallback**: 当常规方法失败时，自动截图并OCR识别
-- **智能重试机制**: 失败自动切换方案，多层fallback策略
-- **抓取质量评估**: 对 HTTP / Playwright / OCR 的结果统一评分，避免把模板页、门户壳页、验证页误判为成功
-- **可观测抓取日志**: 日志会记录每次尝试的方式、质量、分数、触发升级原因和最终选中的抓取方式
-- **验证页识别与等待**: 对 Cloudflare 等 challenge page 进行识别，并在同一浏览器会话内短暂等待自动验证完成
+- **多种获取方式**: HTTP、Playwright 动态渲染、PDF 解析、VLM 文档提取、Tesseract OCR
+- **智能页面加载**: 网络空闲、关键元素、内容/高度稳定性等多策略（`smart_page_loader`）
+- **打分式正文抽取**: JSON-LD / trafilatura / og:description / innerText 多路候选择优（`content_extractor`）
+- **逐页 PDF 截图**: 在线 PDF 预览器按页裁剪，保证每张恰好一页
+- **VLM 文档提取**: `document_ai` 模块通过 `VISION_MODEL_CHAIN` 调用多模态 LLM（**非** Google Cloud Document AI）
+- **多层回退**: 见下方「内容提取回退链」
 
-### LLM智能分析
+### LLM 智能分析
 
 - **三阶段分析**:
-  - 阶段1：英文基本信息提取（含联系人验证）
-  - 阶段2：类型和专业方向分类
-  - 阶段3：中文字段提取
-- **多模型支持**: 兼容OpenAI API和Ollama本地模型
-- **上下文管理**: 智能对话历史管理
-- **部分成功处理**: 即使某阶段失败也会保存已成功的结果
+  - 阶段 1：英文基本信息（截止日期、招生人数、研究方向、机构、联系人）
+  - 阶段 2：机会类型与地理学相关专业方向分类
+  - 阶段 3：中文机构/国家/微信标签
+- **统一 `/chat/completions` 路由**: 文本与图片/文档提取统一走 New API
+- **价格优先的模型链回退**: `TEXT_MODEL_CHAIN` / `VISION_MODEL_CHAIN` 由低到高逐个尝试
+- **死模型熔断**: 401/403 后冷却 30 分钟自动跳过
+- **部分成功**: 某阶段失败仍保存已成功字段；`Error` 列记录问题，`Verifier` 仅在**完全成功**时为 `LLM`
 
-### 联系人验证
+### 联系人与方向验证
 
-- **自动搜索**: 通过 Playwright MCP + **DuckDuckGo** 搜索联系人学术主页
-- **严格URL过滤**: 白名单机制，只访问 .edu、学术平台（ResearchGate/ORCID/Scholar）、大学个人主页等可信页面，自动拦截广告、招聘、社交媒体等无关链接
-- **三层过滤**:
-  1. Bing/DuckDuckGo搜索结果提取后硬过滤
-  2. LLM 页面选择 prompt 严格约束
-  3. LLM 选择结果再次硬过滤兜底
-- **页面加载保障**: 导航后二段等待 + 内容校验，确保页面完全渲染后再提取
+- **联系人搜索**: **HTTP DuckDuckGo → Bing** 为主；结果不足时再 **Playwright MCP** snapshot 补充
+- **方向验证**: 有 MCP 时抓取网页上下文辅助判定；无 MCP 时退化为 LLM 自身知识
+- **严格 URL 过滤**: 白名单机制，只分析可信学术页面
+- 可通过 `ENABLE_WEB_SEARCH=0` 禁用 MCP 初始化；`CONTACT_VERIFICATION_ENABLED`（config）可关闭联系人验证逻辑
 
 ### 数据管理
 
-- **双模式支持**: 本地Excel或云端Google Sheets
-- **断点续传**: 支持中断后继续处理
-- **实时保存**: 每行处理完成后立即保存
-- **自动清理**: 处理完成后自动清理临时PDF文件
+- **双模式支持**: 本地 Excel 或云端 Google Sheets
+- **断点续传**: 跳过 `Verifier` 与 `Error` 均非空的行（见下方规则）
+- **实时保存**: 每行处理完成后立即写回表格与日志
 
-## 📊 系统架构
+## 📊 项目结构
 
+```text
+main.py                  # 根入口（转发至 src.main）
+src/
+  main.py                # 主流程编排
+  core/
+    config.py            # 全局配置、字段单一真源、模型链
+    api_client.py        # New API 客户端（模型链回退 + 熔断）
+    llm_agent.py         # 三阶段 LLM 调用
+    analysis_stage.py    # 分析编排、MCP 初始化
+    contact_verifier.py  # 联系人搜索与验证
+    direction_verifier.py
+    utils.py             # JSON 解析、依赖检查等
+  ingestion/
+    excel_handler.py     # Excel / Sheets 读写
+    fetch_text.py        # 内容获取总编排
+    content_extractor.py # 打分式 HTML 正文抽取
+    text_quality.py      # 文本清洗与质量评估
+    pdf_extractor.py     # PDF 多后端提取
+    google_sources.py    # Google Drive / Docs 处理
+    document_ai.py       # VLM 图片/PDF 文字提取
+    screenshot_ocr_fetcher.py
+  integrations/
+    google_sheets_handler.py
+    mcp_client.py        # Playwright MCP 客户端
+  browser/
+    playwright_worker.py / playwright_process_manager.py
+    smart_page_loader.py
+  tools/
+    check_system.py      # 系统自检
+    update_models.py     # MODELS.md 生成器
+keys/                    # api_key、credentials.json、token.pickle（勿提交）
+cache/                   # pdf/、screenshots/
+logs/                    # run.log
+llm_logs/                # 按行保存的 LLM 对话
+MODELS.md
+requirements.txt
+LICENSE
 ```
-main.py                      # 主入口，协调整体流程
-├── config.py                # 项目配置文件
-├── utils.py                 # 工具函数模块
-├── excel_handler.py         # Excel/数据管理
-├── google_sheets_handler.py # Google Sheets API处理
-├── fetch_text.py            # 内容提取（网页/PDF）
-├── llm_agent.py             # LLM调用模块
-├── analysis_stage.py        # 三阶段分析流程
-├── contact_verifier.py      # 联系人验证（DuckDuckGo + MCP）
-├── mcp_client.py            # Playwright MCP客户端
-├── document_ai.py           # Document AI文档提取
-├── screenshot_ocr_fetcher.py # 截图OCR提取
-├── smart_page_loader.py     # 智能页面加载检测
-├── playwright_process_manager.py # Playwright进程管理
-└── playwright_worker.py     # Playwright工作进程
-```
 
-## ⚙️ 配置选项
+## ⚙️ LLM 配置
 
-在 `config.py` 中可以修改：
+主要配置位于 [`src/core/config.py`](src/core/config.py)（**以下与当前代码一致**）：
 
-### LLM配置
 ```python
-OPENAI_PRIMARY_MODEL = "gpt-5-chat"       # OpenAI首选模型
-OPENAI_FALLBACK_MODEL = "gpt-53-chat"     # OpenAI备选模型（仅在API调用失败时启用）
-OPENAI_BASE_URL = "https://oneapi.gisphere.info/v1"  # API地址
-OLLAMA_MODEL = "qwen3:14b"                # Ollama本地模型
-OLLAMA_BASE_URL = "http://localhost:11434"
+API_BASE_URL = "https://newapi.gisphere.info/v1"
+
+TEXT_MODEL_CHAIN = ["gpt-5.4-mini", "gemini-2.5-flash", "claude-opus-4.5"]
+VISION_MODEL_CHAIN = ["gpt-5.4-mini", "gemini-2.5-flash", "claude-opus-4.5"]
+
+MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 ```
 
-说明：
-- 系统会优先调用 `OPENAI_PRIMARY_MODEL`
-- 只有当 OpenAI API 调用阶段直接失败时，才会自动切换到 `OPENAI_FALLBACK_MODEL`
-- 对 `gpt-53-chat` 会自动使用兼容参数，避免因 `max_tokens` 或 `temperature` 不兼容导致误触发 fallback
+文本分析与 VLM 提取均走 **`/chat/completions`**。模型清单见 [`MODELS.md`](MODELS.md)。字段清单：`STAGE1_FIELDS` / `STAGE2_FIELDS` / `STAGE3_FIELDS` / `GEO_FIELDS`。
 
-### Document AI配置
-```python
-USE_DOCUMENT_AI = True                    # 启用Document AI
-DOCUMENT_AI_MODEL = "gemini-2.5-flash"    # 多模态模型
-DOCUMENT_AI_MAX_PAGES = 10                # 最大处理页数
-```
+### 高级配置开关（config.py，非环境变量）
 
-### Playwright配置
-```python
-USE_PLAYWRIGHT = True                     # 启用Playwright
-PLAYWRIGHT_TIMEOUT = 120                  # 超时时间（秒）
-PLAYWRIGHT_SCROLL_ENABLED = True          # 启用滚动加载
-```
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `USE_PLAYWRIGHT` | `True` | 是否启用 Playwright 子进程抓取 |
+| `USE_DOCUMENT_AI` | `True` | 是否优先 VLM 提取 PDF/图片文字 |
+| `USE_SCREENSHOT_OCR` | `True` | 是否在常规提取失败后截图 OCR |
+| `CONTACT_VERIFICATION_ENABLED` | `True` | 是否执行联系人验证流程 |
+| `OCR_LANGUAGE` | `eng+chi_sim` | Tesseract 语言；需安装对应语言包 |
 
-### 智能页面加载配置
-```python
-USE_SMART_PAGE_LOADER = True              # 启用智能加载检测
-SMART_LOAD_INITIAL_WAIT = 5               # 初始等待时间（秒）
-SMART_LOAD_MAX_WAIT = 30                  # 最大等待时间（秒）
-SMART_LOAD_STABILITY_THRESHOLD = 2        # 稳定性阈值
-```
+## 🔄 处理流程
 
-### 截图OCR配置
-```python
-USE_SCREENSHOT_OCR = True                 # 启用截图OCR
-OCR_LANGUAGE = 'eng+chi_sim'              # OCR语言
-SCREENSHOT_MAX_PAGES = 10                 # 最大截图页数
-SCREENSHOT_CLEANUP_AFTER_USE = True       # 自动清理截图
-```
+1. 加载 Google Sheets 或本地 Excel。
+2. 从 `Source`（优先）或 `Notes` 提取 URL。
+3. 按回退链获取正文（见下节）。
+4. 三阶段 LLM 分析（可部分成功）。
+5. 可选：联系人 HTTP/MCP 搜索、方向 MCP 辅助判定。
+6. 写回结果、`Verifier` / `Error`，保存 `llm_logs/`。
 
-## 📁 目录结构
+### 内容提取回退链
 
-```
-LLM_Analysis/
-├── main.py                       # 主程序入口
-├── config.py                     # 配置文件
-├── utils.py                      # 工具函数
-├── llm_agent.py                  # LLM代理
-├── excel_handler.py              # Excel处理
-├── google_sheets_handler.py      # Google Sheets处理
-├── fetch_text.py                 # 内容获取
-├── analysis_stage.py             # 分析阶段管理
-├── contact_verifier.py           # 联系人验证（DuckDuckGo+MCP）
-├── mcp_client.py                 # Playwright MCP客户端
-├── document_ai.py                # Document AI提取
-├── screenshot_ocr_fetcher.py     # 截图OCR
-├── smart_page_loader.py          # 智能页面加载
-├── playwright_process_manager.py # Playwright进程管理
-├── playwright_worker.py          # Playwright工作进程
-├── safe_playwright.py            # Playwright安全封装
-├── check_dependencies.py         # 依赖检查工具
-├── check_system.py               # 系统检查工具
-├── requirements.txt              # Python依赖
-├── keys/                         # 密钥文件目录
-│   ├── openai_key.txt           # OpenAI API密钥（需自行创建）
-│   ├── credentials.json         # Google API凭据（可选）
-│   └── token.pickle            # Google授权令牌（自动生成）
-├── text_info.xlsx               # 本地Excel数据文件
-├── cache/                       # 缓存目录
-│   ├── pdf/                    # PDF缓存
-│   └── screenshots/            # 截图缓存
-├── logs/                        # 运行日志
-│   └── run.log
-└── llm_logs/                   # LLM对话记录
-```
+**普通网页**
+
+1. HTTP + 打分式正文抽取（`content_extractor`）
+2. Playwright 动态渲染 + 再抽取
+3. 长页/难页截图 → VLM（`document_ai`）→ Tesseract OCR
+
+**直链 PDF**
+
+1. VLM（`document_ai`，`VISION_MODEL_CHAIN`）
+2. PyMuPDF → pdfplumber → PyPDF2
+3. 截图 OCR
+
+**在线 PDF 预览（腾讯文档等）**
+
+1. Playwright 逐页裁剪截图 → VLM → OCR
+
+**Google Drive / Google Docs**
+
+- 专用导出或 Playwright 路径（`google_sources.py`）
+
+## 📋 数据表列说明
+
+### 输入列
+
+| 列名 | 说明 |
+|------|------|
+| `Source` | **首选**链接来源 |
+| `Notes` | 备用链接；仅当 `Source` 无有效 URL 时使用 |
+
+### 输出列（分析结果）
+
+阶段 1–3 字段见「分析字段说明」。此外还有：
+
+| 列名 | 说明 |
+|------|------|
+| `Verifier` | 完全成功时为 `LLM`；部分成功或失败时通常为空 |
+| `Error` | 错误或提示信息；**非空时下次运行也会跳过该行** |
+
+### `Error` 列常见值
+
+| 内容 | 含义 |
+|------|------|
+| 阶段失败摘要 | 如某阶段 LLM 失败、格式校验失败等 |
+| `需转换链接` | 使用了 `Notes` 中的链接且 otherwise 成功；建议将链接移到 `Source` |
+| `可能是第三方网址` | 链接来自 LinkedIn 等第三方平台（`Source` 列） |
+| 抓取失败信息 | 如无有效正文、超时等 |
+
+### 跳过与重跑规则
+
+系统只处理 **`Verifier` 与 `Error` 均为空** 的行：
+
+| 状态 | 下次运行 |
+|------|----------|
+| `Verifier=LLM`，`Error` 空 | **跳过**（完全成功） |
+| `Verifier` 空，`Error` 有内容 | **跳过**（部分成功或已记录失败） |
+| 两者皆空 | **会处理** |
+
+若要**重跑**某行：在表格中清空该行的 `Error`（若曾完全成功，还需清空 `Verifier`）。`Ctrl+C` 中断后，已保存的行按上表规则决定是否跳过。
 
 ## 🔧 分析字段说明
 
-### 阶段1：英文基本信息提取
+> 字段名以 `config.py` 中 `STAGE*_FIELDS` / `GEO_FIELDS` 为单一真源。
+
+### 阶段 1：英文基本信息
 
 | 字段 | 说明 |
 |------|------|
-| Deadline | 申请截止日期（YYYY-MM-DD格式或"Soon"） |
+| Deadline | YYYY-MM-DD 或 "Soon" |
 | Number_Places | 招生人数 |
 | Direction | 研究方向 |
 | University_EN | 机构英文全称 |
-| Contact_Name | 联系人姓名（含Dr./Mr./Ms.前缀） |
+| Contact_Name | 联系人（含 Dr./Mr./Ms.） |
 | Contact_Email | 联系邮箱 |
 
-### 阶段2：类型和专业分类
+### 阶段 2：类型与专业分类
 
-**招生类型**（标记"1"表示适用）：
-- Master Student, Doctoral Student, PostDoc, Research Assistant
-- Competition, Summer School, Conference, Workshop
+**招生类型**（`"1"` = 适用）：Master Student, Doctoral Student, PostDoc, Research Assistant, Competition, Summer School, Conference, Workshop
 
-**专业方向**（选择1-3个）：
-- Physical_Geo, Human_Geo, Urban, GIS, RS, GNSS
+**专业方向**（**1–3** 个，`"1"` = 适用）：Physical_Geo, Human_Geo, Urban, GIS, RS, GNSS
 
-### 阶段3：中文字段提取
+### 阶段 3：中文字段
 
 | 字段 | 说明 |
 |------|------|
 | University_CN | 机构中文全称 |
-| Country_CN | 所在国家中文名 |
-| WX_Label1-5 | 专业领域标签（Label1必填） |
+| Country_CN | 国家中文名 |
+| WX_Label1-5 | 微信标签（Label1 必填，单标签 ≤6 字） |
+
+## 🔩 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ENABLE_WEB_SEARCH` | `1` | `0` = 不初始化 Playwright MCP（方向 MCP 上下文不可用；联系人仍可用 HTTP 搜索） |
+| `PLAYWRIGHT_MCP_HEADLESS` | `0` | `1` = MCP 浏览器无头模式 |
+| `PLAYWRIGHT_HEADLESS` | `0` | 主 Playwright worker 是否无头；默认有头 |
+| `MODEL_COOLDOWN_SECONDS` | `1800` | 模型 401/403 熔断秒数 |
+| `FORCE_IPV4` | `true` | 强制 IPv4（`src/main.py`） |
 
 ## 🛠️ 常见问题
 
-### 安装相关
+**Q: pip 安装通过后还需要什么？**
 
-**Q: Tesseract OCR安装后仍然提示"未找到"？**
+1. `python -m playwright install chromium`
+2. **Tesseract** + **`chi_sim`** 语言包（Linux: `tesseract-ocr-chi-sim`）
+3. **Node.js**（提供 `npx`，供 MCP 使用）
 
-Windows用户确认添加到PATH，或程序会自动查找以下路径：
-- `C:\Program Files\Tesseract-OCR\tesseract.exe`
-- `C:\Program Files (x86)\Tesseract-OCR\tesseract.exe`
+运行 `python -m src.tools.check_system` 检查 Python 包、Tesseract、Chromium、Node/npx。
 
-**Q: Playwright浏览器安装失败？**
+**Q: 如何查看详细错误？**
 
-```bash
-# 设置镜像后重试
-export PLAYWRIGHT_DOWNLOAD_HOST=https://playwright.azureedge.net
-playwright install chromium
-```
+- [`logs/run.log`](logs/run.log)
+- [`llm_logs/`](llm_logs/)（`row_XXXX_*.txt`）
 
-### 使用相关
+**Q: 部分成功算成功吗？**
 
-**Q: 如何查看详细的错误信息？**
+算。部分字段会写入表格，`Error` 记录问题，`Verifier` 不会设为 `LLM`；统计上 `_process_single_row` 仍返回成功。
 
-- 运行日志：`logs/run.log`
-- LLM对话记录：`llm_logs/row_xxxx_yyyymmdd_hhmmss_UTC.txt`
-- 抓取摘要：在 `logs/run.log` 中搜索 `抓取摘要`，可查看当前链接最终使用的抓取方式、质量评分和完整尝试链
-- 分析摘要：在 `logs/run.log` 中搜索 `分析摘要`，可查看三阶段分析的完成情况、失败阶段和返回字段
+**Q: 如何重跑失败/部分成功的行？**
 
-**Q: 如何中断并恢复处理？**
+清空该行的 `Error`（必要时清空 `Verifier`）。
 
-- 使用 `Ctrl+C` 中断，系统会自动保存当前进度
-- 再次运行时自动跳过已处理的行（Verifier不为空的行）
+**Q: Document AI 要配 Google Cloud 吗？**
 
-**Q: 链接提取优先级是什么？**
+不需要。本项目 `document_ai` 走的是 New API 上的 **VLM 模型**（`VISION_MODEL_CHAIN`），不是 Google Cloud Document AI 服务。
 
-系统优先从 `Source` 列提取链接，只有当 `Source` 列没有有效链接时才从 `Notes` 列提取。
+## 🚑 运维与排错
 
-**Q: 联系人验证搜索不到结果？**
+| 现象 | 可能原因 | 处理建议 |
+|------|----------|----------|
+| LLM 401/403 | Key 或模型不可用 | 检查 `keys/api_key.txt`、[`MODELS.md`](MODELS.md)；等熔断或换链 |
+| 模型被跳过 | 熔断中 | 调整链或等 `MODEL_COOLDOWN_SECONDS` |
+| 网页正文极少 | 登录墙/反爬 | `PLAYWRIGHT_HEADLESS=0`；LinkedIn 等可能只有摘要 |
+| PDF 截图空白 | 渲染未完成 | 看 `cache/screenshots/`；增大 `SCREENSHOT_PAGE_RENDER_WAIT_MS` |
+| OCR 乱码/无中文 | 缺 chi_sim | 安装 `tesseract-ocr-chi-sim` |
+| MCP 初始化失败 | 无 Node/npx | 安装 Node.js；HTTP 搜索仍可用 |
+| 联系人搜不到 | MCP 与 HTTP 均失败 | 查网络；看 `logs/run.log` 中 DuckDuckGo/Bing 段落 |
+| 阶段 2 GEO >3 | LLM 超限 | 查 `llm_logs` stage2；系统自动拒绝 |
+| Sheets 首次失败 | 未 OAuth | 删除错误 `token.pickle` 重跑，完成浏览器授权 |
 
-- 检查 `logs/run.log` 中 `MCP DuckDuckGo搜索` 相关日志
-- 确认 Playwright MCP 客户端已正常启动（日志中应有"✅ Playwright MCP客户端已连接"）
-- 程序会自动重试最多3次，若仍失败则跳过验证步骤
+**排错顺序**：`llm_logs/row_*.txt` → `logs/run.log` → `python -m src.tools.check_system`
 
-## 📝 更新日志
+## 🗓️ 更新日志
 
-### v2.2 - 2026-02
-- ✅ 联系人验证搜索引擎从 Bing 切换至 **DuckDuckGo**（避免 Bing 机器人检测导致的重定向问题）
-- ✅ 新增严格 URL 白名单过滤机制（三层过滤，自动拦截广告/招聘/社交媒体页面）
-- ✅ 优化页面加载等待策略（二段等待 + 内容校验 + 最多3次重试）
-- ✅ 修复 `AnalysisStageManager` 清理时的 `AttributeError`
-- ✅ 升级 `openai` 依赖至 v2，解决 `proxies` 参数兼容性问题
-- ✅ 密钥文件统一移至 `keys/` 目录
+### v3.1 - 2026-05
 
-### v2.3 - 2026-03
-- ✅ 网页抓取改为统一策略链（HTTP -> Playwright -> OCR），不再只依赖少量站点白名单
-- ✅ 新增抓取质量评估，自动识别模板页、登录壳页、Cookie 壳页和过短内容
-- ✅ 增强运行日志，记录抓取摘要和分析摘要，便于定位具体失败步骤
-- ✅ 新增门户壳页与 Cloudflare challenge page 识别，减少 Taleo / FindAPhD 类站点的误判
-
-## 🔭 后续路线图
-
-- **方案 C（域名策略记忆）**: 在现有统一策略链基础上，为域名记录历史最优抓取方式；未来可让 `_get_web_fetch_strategy()` 根据历史质量分数动态调整起始抓取顺序，但仍保留统一 fallback 链，避免因单次误判导致策略固化。
-
-### v2.1 - 2025-01
-- ✅ 新增 Document AI 文档提取功能（优先于传统OCR）
-- ✅ 优化智能页面加载检测，提升加载成功率
-- ✅ 改进LLM配置，支持自定义API地址
-- ✅ 优化部分成功处理逻辑，保留有效结果
-
-### v2.0 - 2025-01
-- ✅ 新增截图OCR智能回退功能
-- ✅ 优化多页PDF文档处理
-- ✅ 改进链接提取优先级（Source优先）
-- ✅ 增强OCR文本清理能力
-- ✅ 添加opencv-python支持
-
-### v1.5 - 2024-12
-- ✅ Google Sheets支持
-- ✅ 联系人验证功能
-- ✅ 完整的LLM对话记录
-
-### v1.0 - 2024
-- ✅ 基础三阶段分析
-- ✅ 多种内容提取方式
-- ✅ 本地Excel支持
+- ✅ LLM `/chat/completions` + 模型链回退 + 401/403 熔断
+- ✅ 打分式正文抽取、逐页 PDF 截图、Playwright 默认 headful
+- ✅ [`MODELS.md`](MODELS.md) 多模态分表、config 默认链快照
+- ✅ `fetch_text` 模块化；core 字段/JSON 统一；阶段 2 GEO **1–3** 个
+- ✅ 文档补全：跳过规则、HTTP+MCP 搜索、VLM 说明、OAuth、回退链、Error 语义、Node/Tesseract
+- ✅ `check_system` 系统工具检查；MIT [`LICENSE`](LICENSE)
 
 ## 📄 许可证
 
-[MIT License]
+[MIT License](LICENSE)
 
 ## 🤝 贡献
 
-欢迎提交Issue和Pull Request！
+欢迎提交 Issue 和 Pull Request！
 
 ---
 
-**💡 提示**：遇到问题时，首先查看对应行的LLM对话记录（`llm_logs/`），这通常能帮助您快速定位问题所在！
+**💡 提示**：遇到问题先查该行的 `llm_logs/`，再查 `logs/run.log`。

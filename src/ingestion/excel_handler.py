@@ -1,4 +1,4 @@
-"""
+﻿"""
 Excel文件处理模块 - 现已集成Google Sheets支持
 """
 import pandas as pd
@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 
-from config import EXCEL_FILE, SHEET_NAME, EXCEL_COLUMNS, check_google_credentials
-from google_sheets_handler import GoogleSheetsHandler
+from ..core.config import (
+    EXCEL_FILE, SHEET_NAME, EXCEL_COLUMNS, check_google_credentials,
+    STAGE1_FIELDS, STAGE2_FIELDS, STAGE3_FIELDS, GEO_FIELDS,
+)
+from ..integrations.google_sheets_handler import GoogleSheetsHandler
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +145,7 @@ class ExcelHandler:
         if self.use_google_sheets and self.google_handler:
             return self.google_handler.extract_link_from_row(row_data)
         
-        from utils import extract_url_from_text, is_valid_url
+        from ..core.utils import extract_url_from_text, is_valid_url
         
         # 优先从Source中获取链接
         source = row_data.get('Source', '')
@@ -372,15 +375,8 @@ def validate_analysis_result(result: Dict, stage: str) -> bool:
     
     # 阶段2特殊处理：只返回值为"1"的字段
     if stage == 'stage2':
-        # 定义阶段2允许的所有字段
-        allowed_fields = [
-            'Master Student', 'Doctoral Student', 'PostDoc', 'Research Assistant', 
-            'Competition', 'Summer School', 'Conference', 'Workshop',
-            'Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS'
-        ]
-        
         # 检查返回的字段是否都在允许的列表中
-        invalid_fields = [field for field in result.keys() if field not in allowed_fields]
+        invalid_fields = [field for field in result.keys() if field not in STAGE2_FIELDS]
         if invalid_fields:
             logger.error(f"阶段2 返回了无效字段: {invalid_fields}")
             return False
@@ -391,16 +387,15 @@ def validate_analysis_result(result: Dict, stage: str) -> bool:
             logger.error(f"阶段2 字段值不是'1': {non_one_fields}")
             return False
         
-        # 检查研究方向字段（至少1个，最多5个）
-        geo_fields = ['Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS']
-        marked_geo_fields = [field for field in geo_fields if field in result]
+        # 检查研究方向字段（至少1个，最多3个）
+        marked_geo_fields = [field for field in GEO_FIELDS if field in result]
         
         if len(marked_geo_fields) == 0:
             logger.error("阶段2 至少需要标记1个研究方向字段")
             return False
         
-        if len(marked_geo_fields) > 5:
-            logger.error(f"阶段2 研究方向字段过多: {len(marked_geo_fields)} (最多5个)")
+        if len(marked_geo_fields) > 3:
+            logger.error(f"阶段2 研究方向字段过多: {len(marked_geo_fields)} (最多3个)")
             return False
         
         logger.info(f"阶段2 分析结果格式验证通过，返回 {len(result)} 个字段")
@@ -408,8 +403,8 @@ def validate_analysis_result(result: Dict, stage: str) -> bool:
     
     # 阶段1和阶段3：检查所有必需字段是否存在
     stage_fields = {
-        'stage1': ['Deadline', 'Number_Places', 'Direction', 'University_EN', 'Contact_Name', 'Contact_Email'],
-        'stage3': ['University_CN', 'Country_CN', 'WX_Label1', 'WX_Label2', 'WX_Label3', 'WX_Label4', 'WX_Label5']
+        'stage1': STAGE1_FIELDS,
+        'stage3': STAGE3_FIELDS,
     }
     
     expected_fields = stage_fields.get(stage, [])
@@ -422,3 +417,6 @@ def validate_analysis_result(result: Dict, stage: str) -> bool:
     
     logger.info(f"{stage} 分析结果格式验证通过")
     return True 
+
+
+

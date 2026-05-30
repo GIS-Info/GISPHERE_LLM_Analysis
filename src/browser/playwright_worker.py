@@ -101,10 +101,17 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
         
         logger.info(f"Playwright Worker: 开始处理 {url}")
         
+        # 读取 headless 配置（默认有头，降低反爬触发；可用环境变量覆盖）
+        try:
+            from ..core.config import PLAYWRIGHT_HEADLESS
+            headless_mode = PLAYWRIGHT_HEADLESS
+        except Exception:
+            headless_mode = False
+
         with sync_playwright() as p:
-            # 启动浏览器（无头模式）
+            # 启动浏览器（headless 由配置决定）
             browser = p.chromium.launch(
-                headless=False,
+                headless=headless_mode,
                 args=[
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
@@ -173,14 +180,14 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             else:
                 # 非截图模式：使用智能页面加载检测
                 try:
-                    from config import (USE_SMART_PAGE_LOADER, SMART_LOAD_INITIAL_WAIT,
+                    from ..core.config import (USE_SMART_PAGE_LOADER, SMART_LOAD_INITIAL_WAIT,
                                       SMART_LOAD_MAX_WAIT, SMART_LOAD_STABILITY_INTERVAL,
                                       SMART_LOAD_STABILITY_THRESHOLD, SMART_LOAD_MIN_CONTENT_LENGTH,
                                       SMART_LOAD_MAX_RETRIES)
                     
                     if USE_SMART_PAGE_LOADER:
                         logger.info("使用智能页面加载检测...")
-                        from smart_page_loader import create_smart_loader
+                        from .smart_page_loader import create_smart_loader
                         
                         smart_loader = create_smart_loader({
                             'max_wait_time': SMART_LOAD_MAX_WAIT,
@@ -250,8 +257,15 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
                 scroll_and_load(page)
             
             # 获取页面源码
-            content = page.content()
-            text = html_to_text(content)
+            page_html = page.content()
+            text = html_to_text(page_html)
+
+            # 额外捕获渲染后的 innerText，供下游"多候选打分择优"抽取使用（兜底候选）
+            try:
+                inner_text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception as e:
+                logger.warning(f"获取 innerText 失败: {e}")
+                inner_text = ""
 
             # 如果滚动后拿到的仍然比 challenge 检测阶段更差，则保留更长的那份文本
             if len(challenge_checked_text) > len(text):
@@ -265,6 +279,8 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             return {
                 'success': True,
                 'content': text,
+                'html': page_html,
+                'inner_text': inner_text,
                 'error': None,
                 'length': len(text)
             }
@@ -280,14 +296,18 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
         }
 
 def scroll_and_load(page):
-    """滚动页面以加载所有动态内容"""
+    """滚动页面以加载所有动态内容（滚动参数从 config 读取，失败回退默认）"""
     try:
-        # 滚动参数
-        SCROLL_STEP = 500
-        SCROLL_DELAY = 1000
-        MAX_SCROLLS = 50
-        NO_NEW_CONTENT_THRESHOLD = 3
-        SCROLL_BUFFER = 1000
+        # 滚动参数（优先读配置）
+        try:
+            from ..core.config import (SCROLL_STEP, SCROLL_DELAY, MAX_SCROLLS,
+                                       NO_NEW_CONTENT_THRESHOLD, SCROLL_BUFFER)
+        except Exception:
+            SCROLL_STEP = 500
+            SCROLL_DELAY = 1000
+            MAX_SCROLLS = 50
+            NO_NEW_CONTENT_THRESHOLD = 3
+            SCROLL_BUFFER = 1000
         
         # 获取页面高度
         page_height = page.evaluate("document.body.scrollHeight")
@@ -355,7 +375,7 @@ def capture_screenshots(page, url: str) -> list:
         
         # 获取配置
         try:
-            from config import SCREENSHOT_CACHE_DIR, SCREENSHOT_MAX_PAGES, SCREENSHOT_QUALITY
+            from ..core.config import SCREENSHOT_CACHE_DIR, SCREENSHOT_MAX_PAGES, SCREENSHOT_QUALITY
         except ImportError:
             # 如果无法导入配置，使用默认值
             SCREENSHOT_CACHE_DIR = Path(__file__).parent / "cache" / "screenshots"
@@ -372,9 +392,21 @@ def capture_screenshots(page, url: str) -> list:
         
         screenshot_paths = []
         
-        # 检测是否为腾讯文档或其他PDF查看器
-        if 'docs.qq.com' in url and '/pdf/' in url:
-            logger.info("检测到腾讯文档PDF查看器，使用特殊截图策略")
+        # 检测是否为基于 canvas 的在线 PDF 查看器（腾讯文档等）。
+        # 触发条件放宽：URL 含 /pdf/ ，或页面存在 canvas 渲染的多页查看器。
+        is_pdf_viewer = '/pdf/' in url
+        if not is_pdf_viewer:
+            try:
+                is_pdf_viewer = page.evaluate(
+                    "() => document.querySelectorAll('canvas').length > 0 && !!("
+                    "document.querySelector('.multiPage') || "
+                    "[...document.querySelectorAll('*')].some(e=>e.scrollHeight>e.clientHeight+50 "
+                    "&& e.clientHeight>300 && /(auto|scroll)/.test(getComputedStyle(e).overflowY)))"
+                )
+            except Exception:
+                is_pdf_viewer = False
+        if is_pdf_viewer:
+            logger.info("检测到在线PDF查看器（canvas 多页），使用逐页 clip 截图策略")
             return capture_pdf_viewer_screenshots(page, domain, url_hash, SCREENSHOT_CACHE_DIR, SCREENSHOT_MAX_PAGES)
         
         # 获取页面高度（带重试机制，防止页面未加载完成）
@@ -426,338 +458,216 @@ def capture_screenshots(page, url: str) -> list:
         logger.error(f"详细错误信息:\n{error_details}")
         return []
 
-def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, max_pages: int) -> list:
-    """
-    专门处理PDF查看器（如腾讯文档）的截图
-    
-    对每一页进行滚动截图，确保捕获完整内容
-    
-    Args:
-        page: Playwright页面对象
-        domain: 域名
-        url_hash: URL哈希
-        cache_dir: 缓存目录
-        max_pages: 最大页数
-        
-    Returns:
-        list: 截图文件路径列表
-    """
-    try:
-        screenshot_paths = []
-        
-        # 等待PDF查看器加载（缩短等待时间）
-        page.wait_for_timeout(500)
-        
-        # 尝试查找并切换到iframe（腾讯文档可能使用iframe）
-        try:
-            iframe_element = page.query_selector('iframe')
-            if iframe_element:
-                iframe = iframe_element.content_frame()
-                if iframe:
-                    logger.info("检测到iframe，切换到iframe内部")
-                    page = iframe  # 在iframe内操作
-                    page.wait_for_timeout(300)
-        except Exception as e:
-            logger.debug(f"iframe检测: {e}")
-        
-        # 尝试隐藏或折叠UI元素（工具栏、侧边栏等）
-        try:
-            logger.info("尝试隐藏UI元素...")
-            page.evaluate("""
-                () => {
-                    // 隐藏工具栏
-                    const toolbars = document.querySelectorAll('[role="toolbar"], .toolbar, [class*="toolbar"]');
-                    toolbars.forEach(el => {
-                        if (el) el.style.display = 'none';
-                    });
-                    
-                    // 隐藏侧边栏/缩略图面板
-                    const sidebars = document.querySelectorAll('[role="complementary"], .sidebar, [class*="sidebar"], [class*="thumbnail"]');
-                    sidebars.forEach(el => {
-                        if (el) el.style.display = 'none';
-                    });
-                    
-                    // 隐藏按钮和控制元素
-                    const buttons = document.querySelectorAll('button:not([class*="page"])');
-                    buttons.forEach(el => {
-                        if (el && el.textContent && el.textContent.length < 20) {
-                            el.style.visibility = 'hidden';
-                        }
-                    });
-                }
-            """)
-            logger.info("UI元素隐藏完成")
-        except Exception as e:
-            logger.debug(f"隐藏UI元素失败: {e}")
-        
-        # 使用Ctrl+鼠标滚轮缩小页面（缩小两次达到约90%）
-        try:
-            logger.info("尝试缩小页面...")
-            
-            # 缩小两次
-            for i in range(2):
-                # 按住Ctrl键
-                page.keyboard.down('Control')
-                # 向上滚动鼠标（缩小）
-                page.mouse.wheel(0, 100)
-                page.keyboard.up('Control')
-                page.wait_for_timeout(200)  # 从500ms缩短到200ms
-                logger.debug(f"第{i+1}次缩小完成")
-            
-            logger.info("页面缩小完成")
-            page.wait_for_timeout(300)  # 从1000ms缩短到300ms
-        except Exception as e:
-            logger.warning(f"页面缩小失败: {e}，继续使用原始大小")
-        
-        # 回到第1页（防止之前的操作影响）
-        try:
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(200)
-        except Exception:
-            pass
-        
-        # 尝试检测页数（腾讯文档的页码指示器）
-        try:
-            # 查找页码指示器（格式如 "1/2"）
-            page_indicator = page.evaluate("""
-                () => {
-                    // 尝试多种选择器
-                    const selectors = [
-                        '.page-num-info',  // 腾讯文档常见选择器
-                        '[class*="page"]',
-                        '[class*="Page"]',
-                        'input[type="text"][value*="/"]'
-                    ];
-                    
-                    for (const selector of selectors) {
-                        const element = document.querySelector(selector);
-                        if (element && element.textContent) {
-                            const match = element.textContent.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
-                            if (match) {
-                                return {current: parseInt(match[1]), total: parseInt(match[2])};
-                            }
-                        }
-                        // 也检查value属性
-                        if (element && element.value) {
-                            const match = element.value.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
-                            if (match) {
-                                return {current: parseInt(match[1]), total: parseInt(match[2])};
-                            }
-                        }
-                    }
-                    return null;
-                }
-            """)
-            
-            if page_indicator and page_indicator.get('total'):
-                total_pages = min(page_indicator['total'], max_pages)
-                logger.info(f"检测到PDF共 {page_indicator['total']} 页，将截取前 {total_pages} 页")
-            else:
-                total_pages = 1
-                logger.info("未能检测到页数，默认截取1页")
-        except Exception as e:
-            logger.warning(f"检测页数失败: {e}，默认截取1页")
-            total_pages = 1
-        
-        # 对每一页进行滚动截图
-        for page_num in range(1, total_pages + 1):
-            try:
-                logger.info(f"准备截取第 {page_num}/{total_pages} 页")
-                
-                # 确保滚动到页面顶部
-                try:
-                    page.evaluate("window.scrollTo(0, 0)")
-                    page.wait_for_timeout(300)
-                except Exception as e:
-                    logger.debug(f"重置滚动位置失败: {e}")
-                
-                # 使用滚动截图策略
-                page_screenshots = scroll_and_capture_page(page, cache_dir, domain, url_hash, page_num, total_pages)
-                screenshot_paths.extend(page_screenshots)
-                
-                logger.info(f"第 {page_num} 页截图完成，共 {len(page_screenshots)} 张")
-                
-                # 如果还有下一页，翻页
-                if page_num < total_pages:
-                    try:
-                        logger.info(f"准备翻到第 {page_num + 1} 页")
-                        
-                        # 尝试多种翻页方法
-                        page_turned = False
-                        
-                        # 方法1: 尝试查找并点击"下一页"按钮
-                        try:
-                            next_button_selectors = [
-                                'button[aria-label*="next"]',
-                                'button[aria-label*="Next"]',
-                                'button[title*="下一页"]',
-                                'button[title*="next"]',
-                                '[class*="next-page"]',
-                                '[id*="next-page"]'
-                            ]
-                            
-                            for selector in next_button_selectors:
-                                next_button = page.query_selector(selector)
-                                if next_button:
-                                    next_button.click()
-                                    logger.info(f"点击下一页按钮: {selector}")
-                                    page.wait_for_timeout(500)
-                                    page_turned = True
-                                    break
-                        except Exception as e:
-                            logger.debug(f"查找下一页按钮失败: {e}")
-                        
-                        # 方法2: 如果没找到按钮，使用键盘ArrowDown
-                        if not page_turned:
-                            try:
-                                logger.info("使用键盘ArrowDown翻页")
-                                page.keyboard.press('ArrowDown')
-                                page.wait_for_timeout(500)
-                                page_turned = True
-                            except Exception as e:
-                                logger.debug(f"键盘翻页失败: {e}")
-                        
-                        # 验证翻页是否成功
-                        if page_turned:
-                            try:
-                                current_page = page.evaluate("""
-                                    () => {
-                                        const input = document.querySelector('input[value*="/"]');
-                                        if (input && input.value) {
-                                            return parseInt(input.value.split('/')[0]);
-                                        }
-                                        return null;
-                                    }
-                                """)
-                                
-                                next_page_num = page_num + 1
-                                if current_page == next_page_num:
-                                    logger.info(f"翻页验证成功: 当前为第 {current_page} 页")
-                                else:
-                                    logger.warning(f"翻页验证失败: 期望第 {next_page_num} 页，实际第 {current_page} 页")
-                            except Exception as e:
-                                logger.debug(f"翻页验证失败: {e}")
-                        
-                    except Exception as e:
-                        logger.warning(f"翻页失败: {e}")
-                
-            except Exception as e:
-                logger.error(f"第 {page_num} 页截图失败: {e}")
-                continue
-        
-        logger.info(f"PDF查看器截图完成，共 {len(screenshot_paths)} 张")
-        return screenshot_paths
-        
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        logger.error(f"PDF查看器截图失败: {e}")
-        logger.error(f"详细错误信息:\n{error_details}")
-        return []
+# ── 在线 PDF 查看器逐页 clip 截图（腾讯文档等 canvas 多页）──────────────────
+# 思路（已在真实腾讯文档上验证）：
+#   1) 定位内部滚动容器（.multiPage 或最大的可滚动元素）；
+#   2) 坐标探测隐藏盖在顶部/左侧、遮挡正文的 UI 覆盖条（与具体 class 无关）；
+#   3) 逐个把 canvas 滚动进视口并微调，使整页完整可见；
+#   4) 用 CDP Page.captureScreenshot 按 canvas 包围盒精确裁剪（绕过 Playwright 等字体的卡顿）。
 
-def scroll_and_capture_page(page, cache_dir, domain: str, url_hash: str, page_num: int, total_pages: int) -> list:
-    """
-    对单个页面进行滚动截图
-    
-    Args:
-        page: Playwright页面对象
-        cache_dir: 缓存目录
-        domain: 域名
-        url_hash: URL哈希
-        page_num: 当前页码
-        total_pages: 总页数
-        
-    Returns:
-        list: 截图文件路径列表
-    """
-    screenshots = []
-    
+_JS_FIND_SCROLLER = """
+() => {
+  const sc = document.querySelector('.multiPage') ||
+    [...document.querySelectorAll('*')].filter(e=>e.scrollHeight>e.clientHeight+50 && e.clientHeight>300 &&
+      /(auto|scroll)/.test(getComputedStyle(e).overflowY)).sort((a,b)=>b.scrollHeight-a.scrollHeight)[0];
+  if(!sc) return null;
+  sc.setAttribute('data-sc','1');
+  return {sh:sc.scrollHeight, ch:sc.clientHeight};
+}
+"""
+
+# 坐标探测：把盖在顶部/左侧的覆盖条隐藏（不依赖 class 名）
+_JS_HIDE_COVERS = """
+() => {
+  const sc=document.querySelector('[data-sc]'); const vw=innerWidth, vh=innerHeight;
+  const hidden=[];
+  const tryHide=(x,y,edge)=>{
+    const el=document.elementFromPoint(x,y); if(!el) return;
+    let node=el;
+    for(let k=0;k<5 && node && node!==document.body && node!==document.documentElement;k++){
+      if(node===sc || node.contains(sc) || node.querySelector('canvas')) return;
+      const r=node.getBoundingClientRect();
+      const isTop = edge==='top' && r.top<=6 && r.height<300 && r.width>vw*0.35;
+      const isLeft = edge==='left' && r.left<=6 && r.width<340 && r.height>vh*0.4;
+      if(isTop || isLeft){ node.style.setProperty('display','none','important'); hidden.push((node.className||node.tagName).toString().slice(0,30)); return; }
+      node=node.parentElement;
+    }
+  };
+  [4,24,48,80,120,160].forEach(y=>tryHide(vw/2,y,'top'));
+  [40,120,240,400].forEach(y=>tryHide(8,y,'left'));
+  return hidden;
+}
+"""
+
+
+def _canvas_rect(page, i: int):
+    """返回第 i 个 canvas 在视口内的可见包围盒及完整高度。"""
+    return page.evaluate("""(i)=>{
+        const c=document.querySelectorAll('canvas')[i]; if(!c) return null;
+        const r=c.getBoundingClientRect(); const vw=innerWidth, vh=innerHeight;
+        const x=Math.max(0,r.left), y=Math.max(0,r.top);
+        const w=Math.min(r.right,vw)-x, h=Math.min(r.bottom,vh)-y;
+        return {x:Math.round(x),y:Math.round(y),w:Math.round(w),h:Math.round(h),
+                top:Math.round(r.top),bottom:Math.round(r.bottom),fullh:Math.round(r.height),fullw:Math.round(r.width)};
+    }""", i)
+
+
+def _scroller_at_bottom(page) -> bool:
+    return page.evaluate(
+        "(()=>{const e=document.querySelector('[data-sc]');"
+        "return e?(e.scrollTop+e.clientHeight>=e.scrollHeight-5):true;})()"
+    )
+
+
+def _maybe_fit_width(page, viewport_w: int):
+    """横向溢出（canvas 比视口宽）时，用 Ctrl+'-' 缩小到适配宽度，避免右侧被裁掉。"""
     try:
-        # 获取视口高度
-        viewport_height = page.viewport_size['height']
-        
-        # 滚动参数
-        scroll_step = 400  # 每次滚动400像素
-        max_scrolls = 30   # 最多滚动30次
-        no_change_count = 0
-        no_change_threshold = 3
-        last_scroll_pos = -1
-        
-        scroll_count = 0
-        
-        while scroll_count < max_scrolls:
-            # 截取当前视口
-            screenshot_path = cache_dir / f"{domain}_{url_hash}_page{page_num}_{scroll_count}.png"
-            page.screenshot(path=str(screenshot_path), type='png', full_page=False)
-            screenshots.append(str(screenshot_path))
-            logger.debug(f"第 {page_num} 页截图 {scroll_count}: {screenshot_path.name}")
-            
-            # 获取当前滚动位置
-            try:
-                current_scroll_pos = page.evaluate("window.pageYOffset || document.documentElement.scrollTop")
-                page_height = page.evaluate("document.documentElement.scrollHeight")
-                
-                # 检查是否到达底部
-                if current_scroll_pos + viewport_height >= page_height - 50:
-                    logger.info(f"第 {page_num} 页已到达底部")
-                    break
-                
-                # 检查滚动位置是否变化
-                if current_scroll_pos == last_scroll_pos:
-                    no_change_count += 1
-                    if no_change_count >= no_change_threshold:
-                        logger.info(f"第 {page_num} 页滚动位置连续{no_change_threshold}次未变化，停止滚动")
-                        break
-                else:
-                    no_change_count = 0
-                    last_scroll_pos = current_scroll_pos
-                
-            except Exception as e:
-                logger.warning(f"获取滚动信息失败: {e}")
-            
-            # 向下滚动
-            try:
-                page.evaluate(f"window.scrollBy(0, {scroll_step})")
-                page.wait_for_timeout(200)  # 从400ms缩短到200ms
-                scroll_count += 1
-                
-                # 检查是否翻页了
-                if page_num < total_pages:
-                    try:
-                        current_page = page.evaluate("""
-                            () => {
-                                const input = document.querySelector('input[value*="/"]');
-                                if (input && input.value) {
-                                    return parseInt(input.value.split('/')[0]);
-                                }
-                                return null;
-                            }
-                        """)
-                        
-                        if current_page and current_page > page_num:
-                            logger.info(f"滚动时翻到第{current_page}页，停止当前页截图")
-                            break
-                    except Exception:
-                        pass
-                        
-            except Exception as e:
-                logger.warning(f"滚动失败: {e}")
-                break
-        
-        logger.info(f"第 {page_num} 页完成，共截取 {len(screenshots)} 张")
-        return screenshots
-        
+        for _ in range(3):
+            rect = _canvas_rect(page, 0)
+            if not rect or rect.get('fullw', 0) <= viewport_w - 4:
+                return
+            page.keyboard.down('Control')
+            page.keyboard.press('Minus')
+            page.keyboard.up('Control')
+            page.wait_for_timeout(250)
     except Exception as e:
-        logger.error(f"第 {page_num} 页滚动截图失败: {e}")
-        # 至少返回一张截图
-        if not screenshots:
+        logger.debug(f"自动适配宽度失败（忽略）: {e}")
+
+
+def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, max_pages: int) -> list:
+    """在线 PDF 查看器逐页 clip 截图，确保每张恰好是完整一页。"""
+    try:
+        import base64
+
+        # 读取配置（失败回退默认值）
+        try:
+            from ..core.config import (PDF_VIEWER_HIDE_UI, PDF_VIEWER_AUTO_ZOOM,
+                                       SCREENSHOT_MAX_SHOTS, SCREENSHOT_PAGE_RENDER_WAIT_MS)
+            hide_ui = PDF_VIEWER_HIDE_UI
+            auto_zoom = PDF_VIEWER_AUTO_ZOOM
+            max_shots = SCREENSHOT_MAX_SHOTS
+            render_wait = SCREENSHOT_PAGE_RENDER_WAIT_MS
+        except Exception:
+            hide_ui, auto_zoom, max_shots, render_wait = True, True, 30, 1200
+
+        screenshot_paths = []
+
+        # 等待 canvas 渲染出来
+        for _ in range(20):
             try:
-                screenshot_path = cache_dir / f"{domain}_{url_hash}_page{page_num}_0.png"
-                page.screenshot(path=str(screenshot_path), type='png', full_page=False)
-                screenshots.append(str(screenshot_path))
+                if page.evaluate("document.querySelectorAll('canvas').length") > 0:
+                    break
             except Exception:
                 pass
-        return screenshots
+            page.wait_for_timeout(500)
+        page.wait_for_timeout(min(render_wait, 1500))
+
+        # 1) 定位滚动容器
+        scroller = page.evaluate(_JS_FIND_SCROLLER)
+        if not scroller:
+            logger.warning("未找到 PDF 查看器滚动容器，回退整页截图")
+            fallback = cache_dir / f"{domain}_{url_hash}_full.png"
+            page.screenshot(path=str(fallback), type='png', full_page=True)
+            return [str(fallback)]
+        logger.info(f"滚动容器: {scroller}")
+
+        # 2) 隐藏遮挡 UI
+        if hide_ui:
+            try:
+                hidden = page.evaluate(_JS_HIDE_COVERS)
+                page.wait_for_timeout(300)
+                logger.info(f"已隐藏遮挡 UI: {hidden}")
+            except Exception as e:
+                logger.debug(f"隐藏 UI 失败（忽略）: {e}")
+
+        viewport = page.viewport_size or {'width': 1920, 'height': 1080}
+        vw, vh = viewport['width'], viewport['height']
+
+        # 3) 横向溢出自动适配宽度
+        if auto_zoom:
+            _maybe_fit_width(page, vw)
+
+        # 建立 CDP 会话用于精确裁剪截图
+        try:
+            cdp = page.context.new_cdp_session(page)
+        except Exception as e:
+            logger.warning(f"无法创建 CDP 会话，回退 page.screenshot: {e}")
+            cdp = None
+
+        def shot(path, r):
+            if cdp is not None:
+                res = cdp.send("Page.captureScreenshot", {"format": "png",
+                    "clip": {"x": r["x"], "y": r["y"], "width": r["w"], "height": r["h"], "scale": 1}})
+                Path(path).write_bytes(base64.b64decode(res["data"]))
+            else:
+                page.screenshot(path=str(path), type='png',
+                                clip={"x": r["x"], "y": r["y"], "width": r["w"], "height": r["h"]})
+
+        # 4) 逐页滚动 + clip
+        limit = min(max_pages, max_shots)
+        i = 0
+        miss = 0
+        while i < limit:
+            try:
+                exists = page.evaluate("(i)=>i < document.querySelectorAll('canvas').length", i)
+            except Exception:
+                exists = False
+            if not exists:
+                if _scroller_at_bottom(page):
+                    break
+                page.evaluate("(()=>{const e=document.querySelector('[data-sc]');if(e)e.scrollTop+=e.clientHeight*0.8;})()")
+                page.wait_for_timeout(700)
+                miss += 1
+                if miss > 6:
+                    break
+                continue
+            miss = 0
+
+            block = "start" if i == 0 else "center"
+            try:
+                page.eval_on_selector_all(
+                    "canvas", "(els,d)=>els[d.i] && els[d.i].scrollIntoView({block:d.b})", {"i": i, "b": block}
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(450)
+
+            r = _canvas_rect(page, i)
+            # 若整页未完全在视口内，微调使其完整可见
+            if r and (r["top"] < -2 or r["bottom"] > vh + 2):
+                try:
+                    page.evaluate("(d)=>{const e=document.querySelector('[data-sc]');if(e)e.scrollTop+=d;}", r["top"])
+                    page.wait_for_timeout(350)
+                    r = _canvas_rect(page, i)
+                except Exception:
+                    pass
+
+            # 跳过零尺寸幽灵 canvas
+            if not r or r["fullh"] < 50:
+                if _scroller_at_bottom(page):
+                    break
+                i += 1
+                continue
+
+            if r["w"] > 50 and r["h"] > 50:
+                path = cache_dir / f"{domain}_{url_hash}_p{i+1:02d}.png"
+                try:
+                    shot(path, r)
+                    full = r["h"] >= r["fullh"] - 3
+                    logger.info(f"第 {i+1} 页截图: {path.name} h={r['h']}/{r['fullh']} {'FULL' if full else 'PART'}")
+                    screenshot_paths.append(str(path))
+                except Exception as e:
+                    logger.warning(f"第 {i+1} 页截图失败: {e}")
+            i += 1
+
+        logger.info(f"PDF查看器逐页截图完成，共 {len(screenshot_paths)} 张")
+        return screenshot_paths
+
+    except Exception as e:
+        import traceback
+        logger.error(f"PDF查看器截图失败: {e}")
+        logger.error(f"详细错误信息:\n{traceback.format_exc()}")
+        return []
 
 if __name__ == "__main__":
     # 从命令行参数获取URL
@@ -776,4 +686,7 @@ if __name__ == "__main__":
     
     # 输出JSON结果
     print(json.dumps(result, ensure_ascii=False))
+
+
+
 

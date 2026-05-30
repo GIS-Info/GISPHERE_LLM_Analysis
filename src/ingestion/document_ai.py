@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Optional, List, Union
 import io
 
-from config import (
+from ..core.config import (
     DOCUMENT_AI_MODEL, 
+    DOCUMENT_AI_FALLBACK_MODEL,
     DOCUMENT_AI_TIMEOUT, 
     DOCUMENT_AI_MAX_PAGES,
-    OPENAI_BASE_URL,
     check_openai_key
 )
+from ..core.api_client import NewAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -50,17 +51,13 @@ Extract the text now:"""
                 logger.warning("Document AI: No API key found")
                 return False
             
-            import openai
-            self._client = openai.OpenAI(
-                api_key=api_key,
-                base_url=OPENAI_BASE_URL
+            self._client = NewAPIClient(api_key=api_key, timeout=DOCUMENT_AI_TIMEOUT)
+            logger.info(
+                f"✅ Document AI initialized with model: {DOCUMENT_AI_MODEL}, "
+                f"fallback: {DOCUMENT_AI_FALLBACK_MODEL}"
             )
-            logger.info(f"✅ Document AI initialized with model: {DOCUMENT_AI_MODEL}")
             return True
             
-        except ImportError:
-            logger.error("Document AI: openai package not installed")
-            return False
         except Exception as e:
             logger.error(f"Document AI initialization failed: {e}")
             return False
@@ -90,46 +87,13 @@ Extract the text now:"""
             return None
         
         try:
-            # 读取图片并转换为 base64
-            base64_image = self._encode_image_to_base64(image_path)
-            if not base64_image:
-                return None
-            
             # 确定图片类型
             media_type = self._get_media_type(image_path)
+            image_data_url = self._client.image_path_to_data_url(image_path, media_type)
             
             logger.info(f"Extracting text from image: {image_path.name}")
             
-            # 调用多模态API
-            response = self._client.chat.completions.create(
-                model=DOCUMENT_AI_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": self.EXTRACTION_SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": self.EXTRACTION_USER_PROMPT
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{media_type};base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=4096,
-                temperature=0.1,
-                timeout=DOCUMENT_AI_TIMEOUT
-            )
-            
-            extracted_text = response.choices[0].message.content
+            extracted_text = self._extract_text_from_data_url(image_data_url)
             
             if extracted_text and extracted_text.strip():
                 logger.info(f"✅ Document AI extracted {len(extracted_text)} characters from image")
@@ -229,36 +193,9 @@ Extract the text now:"""
                     
                     logger.info(f"Processing PDF page {page_num + 1}/{pages_to_process}")
                     
-                    # 调用多模态API
-                    response = self._client.chat.completions.create(
-                        model=DOCUMENT_AI_MODEL,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": self.EXTRACTION_SYSTEM_PROMPT
-                            },
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": self.EXTRACTION_USER_PROMPT
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/png;base64,{base64_image}"
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        max_tokens=4096,
-                        temperature=0.1,
-                        timeout=DOCUMENT_AI_TIMEOUT
+                    page_text = self._extract_text_from_data_url(
+                        f"data:image/png;base64,{base64_image}"
                     )
-                    
-                    page_text = response.choices[0].message.content
                     
                     if page_text and page_text.strip():
                         all_texts.append(f"--- Page {page_num + 1} ---\n{page_text.strip()}")
@@ -285,6 +222,22 @@ Extract the text now:"""
             return None
         except Exception as e:
             logger.error(f"Document AI PDF extraction failed: {e}")
+            return None
+
+    def _extract_text_from_data_url(self, image_data_url: str) -> Optional[str]:
+        """走 VISION_MODEL_CHAIN（价格升序）回退的 /chat/completions 视觉调用。"""
+        prompt = f"{self.EXTRACTION_SYSTEM_PROMPT}\n\n{self.EXTRACTION_USER_PROMPT}"
+        try:
+            return self._client.complete_vision(
+                text=prompt,
+                image_data_url=image_data_url,
+                max_output_tokens=4096,
+                temperature=0.1,
+                json_mode=False,
+                timeout=DOCUMENT_AI_TIMEOUT,
+            )
+        except Exception as e:
+            logger.error(f"Document AI 视觉模型链调用失败: {e}")
             return None
     
     def _encode_image_to_base64(self, image_path: Path) -> Optional[str]:
@@ -348,3 +301,6 @@ def test_document_ai():
 
 if __name__ == "__main__":
     test_document_ai()
+
+
+

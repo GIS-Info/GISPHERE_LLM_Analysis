@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 系统检查脚本
 用于验证LLM分析系统的各个组件是否正常工作
@@ -18,7 +18,7 @@ def check_dependencies():
     """检查依赖包"""
     logger.info("=== 检查依赖包 ===")
     try:
-        from utils import check_dependencies
+        from ..core.utils import check_dependencies
         return check_dependencies()
     except Exception as e:
         logger.error(f"依赖包检查失败: {e}")
@@ -28,8 +28,8 @@ def check_data_source():
     """检查数据源（Google Sheets或Excel文件）"""
     logger.info("=== 检查数据源 ===")
     try:
-        from config import check_google_credentials, EXCEL_FILE
-        from excel_handler import ExcelHandler
+        from ..core.config import check_google_credentials, EXCEL_FILE
+        from ..ingestion.excel_handler import ExcelHandler
         
         # 检查Google Sheets凭据
         if check_google_credentials():
@@ -73,13 +73,13 @@ def check_data_source():
 def check_local_excel_file(handler=None):
     """检查本地Excel文件"""
     try:
-        from config import EXCEL_FILE
+        from ..core.config import EXCEL_FILE
         if not EXCEL_FILE.exists():
             logger.error(f"Excel文件不存在: {EXCEL_FILE}")
             return False
         
         if handler is None:
-            from excel_handler import ExcelHandler
+            from ..ingestion.excel_handler import ExcelHandler
             handler = ExcelHandler(use_google_sheets=False)
         
         if not handler.load_data():
@@ -97,7 +97,7 @@ def check_llm_service():
     """检查LLM服务"""
     logger.info("=== 检查LLM服务 ===")
     try:
-        from llm_agent import LLMAgent
+        from ..core.llm_agent import LLMAgent
         agent = LLMAgent()
         model_info = agent.get_model_info()
         
@@ -118,7 +118,7 @@ def check_llm_service():
         if not model_info['use_openai']:
             try:
                 import requests
-                from config import OLLAMA_BASE_URL, OLLAMA_MODEL
+                from ..core.config import OLLAMA_BASE_URL, OLLAMA_MODEL
                 
                 response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
                 if response.status_code == 200:
@@ -146,7 +146,7 @@ def check_content_fetcher():
     """检查内容获取功能"""
     logger.info("=== 检查内容获取功能 ===")
     try:
-        from fetch_text import ContentFetcher
+        from ..ingestion.fetch_text import ContentFetcher
         fetcher = ContentFetcher()
         
         # 测试网页内容获取
@@ -173,7 +173,7 @@ def check_directories():
     """检查目录结构"""
     logger.info("=== 检查目录结构 ===")
     try:
-        from config import ensure_directories, CACHE_DIR, LOG_DIR, LLM_LOG_DIR
+        from ..core.config import ensure_directories, CACHE_DIR, LOG_DIR, LLM_LOG_DIR
         
         ensure_directories()
         
@@ -191,6 +191,144 @@ def check_directories():
         logger.error(f"目录结构检查失败: {e}")
         return False
 
+def check_system_tools():
+    """检查 pip 无法安装的系统工具（Node/npx、Tesseract、Playwright Chromium）。"""
+    logger.info("=== 检查系统工具 ===")
+    ok = True
+
+    # Node.js + npx（Playwright MCP: npx @playwright/mcp）
+    try:
+        import shutil
+        import subprocess
+        node_bin = shutil.which("node")
+        npx_bin = shutil.which("npx")
+        if node_bin:
+            try:
+                ver = subprocess.run(
+                    ["node", "--version"], capture_output=True, text=True, timeout=5
+                )
+                logger.info(f"✅ Node.js 已安装: {ver.stdout.strip() or node_bin}")
+            except Exception:
+                logger.info(f"✅ Node.js 已安装: {node_bin}")
+        else:
+            logger.warning("⚠️  未找到 Node.js（Playwright MCP 初始化将失败；HTTP 搜索仍可用）")
+            ok = False
+        if npx_bin:
+            logger.info(f"✅ npx 可用: {npx_bin}")
+        else:
+            logger.warning("⚠️  未找到 npx")
+            ok = False
+    except Exception as e:
+        logger.warning(f"⚠️  Node.js/npx 检查异常: {e}")
+        ok = False
+
+    # Tesseract（pytesseract OCR 回退路径；config.OCR_LANGUAGE = eng+chi_sim）
+    try:
+        import shutil
+        import pytesseract
+        tesseract_bin = shutil.which("tesseract")
+        if tesseract_bin:
+            logger.info(f"✅ Tesseract 已安装: {tesseract_bin}")
+        else:
+            logger.warning("⚠️  未找到 Tesseract（OCR 回退将不可用）")
+            logger.info("   Windows: https://github.com/UB-Mannheim/tesseract/wiki")
+            logger.info("   Linux: sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim")
+            ok = False
+        try:
+            pytesseract.get_tesseract_version()
+            langs = pytesseract.get_languages(config="")
+            if "chi_sim" in langs:
+                logger.info("✅ Tesseract 语言包 chi_sim 已安装")
+            else:
+                logger.warning("⚠️  Tesseract 缺少 chi_sim 语言包（中文 OCR 可能失败）")
+                logger.info("   Linux: sudo apt-get install tesseract-ocr-chi-sim")
+                ok = False
+        except Exception as e:
+            logger.warning(f"⚠️  pytesseract 无法调用 Tesseract: {e}")
+            ok = False
+    except ImportError:
+        logger.warning("⚠️  pytesseract 未安装")
+        ok = False
+
+    # Playwright Chromium
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        logger.info("✅ Playwright Chromium 可用")
+    except ImportError:
+        logger.warning("⚠️  playwright 未安装")
+        ok = False
+    except Exception as e:
+        logger.warning(f"⚠️  Playwright Chromium 不可用: {e}")
+        logger.info("   请运行: python -m playwright install chromium")
+        ok = False
+
+    return ok
+
+
+def check_contact_verification():
+    """检查联系人验证功能"""
+    logger.info("=== 检查联系人验证功能 ===")
+    try:
+        from ..core.config import CONTACT_VERIFICATION_ENABLED
+        
+        if not CONTACT_VERIFICATION_ENABLED:
+            logger.info("⚠️  联系人验证功能已禁用")
+            return True
+        
+        # 检查Playwright依赖
+        try:
+            import playwright
+            from playwright.sync_api import sync_playwright
+            logger.info("✅ Playwright依赖检查通过")
+            
+            # 检查浏览器是否已安装
+            try:
+                with sync_playwright() as p:
+                    # 尝试获取已安装的浏览器
+                    browsers = p.chromium
+                    logger.info("✅ Playwright Chromium浏览器可用")
+            except Exception as e:
+                logger.warning(f"⚠️  Playwright浏览器未安装: {e}")
+                logger.info("请运行: playwright install chromium")
+                return True  # 不阻止系统运行
+                
+        except ImportError as e:
+            logger.warning(f"⚠️  Playwright依赖缺失: {e}")
+            logger.info("可运行: pip install playwright && playwright install chromium")
+            return True  # 不阻止系统运行，只是功能受限
+        
+        # 测试基础搜索功能
+        try:
+            from ..core.llm_agent import LLMAgent
+            from ..core.contact_verifier import ContactVerifier
+            
+            llm_agent = LLMAgent()
+            verifier = ContactVerifier(llm_agent)
+            
+            # 测试判断逻辑
+            should_verify, reason = verifier.should_verify_contact(
+                "John Smith", "john@example.com", "Contact: Dr. John Smith"
+            )
+            
+            logger.info(f"验证逻辑测试: {should_verify}, {reason}")
+            logger.info("✅ 联系人验证功能初始化成功")
+            
+            # 清理资源
+            verifier.cleanup()
+            
+        except Exception as e:
+            logger.warning(f"⚠️  联系人验证功能测试失败: {e}")
+            return True  # 不阻止系统运行
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"联系人验证功能检查失败: {e}")
+        return False
+
 def main():
     """主检查函数"""
     logger.info("开始系统检查...")
@@ -199,6 +337,7 @@ def main():
     checks = [
         ("目录结构", check_directories),
         ("依赖包", check_dependencies),
+        ("系统工具", check_system_tools),
         ("数据源", check_data_source),
         ("LLM服务", check_llm_service),
         ("内容获取", check_content_fetcher),
@@ -236,67 +375,6 @@ def main():
         logger.warning(f"⚠️  有 {total - passed} 项检查失败，请查看上述详细信息")
         return False
 
-def check_contact_verification():
-    """检查联系人验证功能"""
-    logger.info("=== 检查联系人验证功能 ===")
-    try:
-        from config import CONTACT_VERIFICATION_ENABLED
-        
-        if not CONTACT_VERIFICATION_ENABLED:
-            logger.info("⚠️  联系人验证功能已禁用")
-            return True
-        
-        # 检查Playwright依赖
-        try:
-            import playwright
-            from playwright.sync_api import sync_playwright
-            logger.info("✅ Playwright依赖检查通过")
-            
-            # 检查浏览器是否已安装
-            try:
-                with sync_playwright() as p:
-                    # 尝试获取已安装的浏览器
-                    browsers = p.chromium
-                    logger.info("✅ Playwright Chromium浏览器可用")
-            except Exception as e:
-                logger.warning(f"⚠️  Playwright浏览器未安装: {e}")
-                logger.info("请运行: playwright install chromium")
-                return True  # 不阻止系统运行
-                
-        except ImportError as e:
-            logger.warning(f"⚠️  Playwright依赖缺失: {e}")
-            logger.info("可运行: pip install playwright && playwright install chromium")
-            return True  # 不阻止系统运行，只是功能受限
-        
-        # 测试基础搜索功能
-        try:
-            from llm_agent import LLMAgent
-            from contact_verifier import ContactVerifier
-            
-            llm_agent = LLMAgent()
-            verifier = ContactVerifier(llm_agent)
-            
-            # 测试判断逻辑
-            should_verify, reason = verifier.should_verify_contact(
-                "John Smith", "john@example.com", "Contact: Dr. John Smith"
-            )
-            
-            logger.info(f"验证逻辑测试: {should_verify}, {reason}")
-            logger.info("✅ 联系人验证功能初始化成功")
-            
-            # 清理资源
-            verifier.cleanup()
-            
-        except Exception as e:
-            logger.warning(f"⚠️  联系人验证功能测试失败: {e}")
-            return True  # 不阻止系统运行
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"联系人验证功能检查失败: {e}")
-        return False
-
 if __name__ == "__main__":
     try:
         success = main()
@@ -307,3 +385,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"检查过程发生异常: {e}")
         sys.exit(1) 
+
+
+

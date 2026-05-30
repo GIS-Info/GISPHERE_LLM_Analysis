@@ -3,8 +3,6 @@
 用于在阶段二（专业方向识别）无法匹配时，通过网络搜索进行二次验证
 """
 import logging
-import json
-import re
 import time
 from typing import Optional, Dict, List, Tuple
 
@@ -28,27 +26,14 @@ class DirectionVerifier:
         else:
             logger.info("⚠️  DirectionVerifier: 未提供 MCP 客户端，将仅使用 LLM 自身知识进行推断")
             
-        self.geo_fields = ['Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS']
+        from .config import GEO_FIELDS
+        self.geo_fields = list(GEO_FIELDS)
         
     def _parse_json_obj(self, text: str) -> dict:
-        """从 LLM 返回文本中提取 JSON 对象"""
-        text = text.strip()
-        text = re.sub(r'^```[a-z]*\n?', '', text)
-        text = re.sub(r'\n?```$', '', text)
-        text = text.strip()
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except Exception:
-                pass
-        return {}
+        """从 LLM 返回文本中提取 JSON 对象（统一委托 utils，失败回退空 dict）。"""
+        from .utils import extract_json_object
+        res = extract_json_object(text)
+        return res if isinstance(res, dict) else {}
         
     def _extract_actual_directions(self, text: str) -> List[str]:
         """步骤A：从原文中提取真实的 1-3 个研究方向/工作内容"""
@@ -210,3 +195,6 @@ Expected JSON Format (Example if unrelated):
 
     def __del__(self):
         self.cleanup()
+
+
+

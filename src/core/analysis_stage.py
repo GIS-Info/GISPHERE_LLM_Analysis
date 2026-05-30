@@ -1,15 +1,18 @@
-"""
+﻿"""
 分析阶段封装模块
 """
 import os
 import logging
 from typing import Dict, Optional, Tuple
-from llm_agent import LLMAgent
-from excel_handler import validate_analysis_result
-from contact_verifier import ContactVerifier
-from direction_verifier import DirectionVerifier
-from utils import clean_email_format
-from config import ENABLE_WEB_SEARCH, PLAYWRIGHT_MCP_HEADLESS
+from .llm_agent import LLMAgent
+from ..ingestion.excel_handler import validate_analysis_result
+from .contact_verifier import ContactVerifier
+from .direction_verifier import DirectionVerifier
+from .utils import clean_email_format
+from .config import (
+    ENABLE_WEB_SEARCH, PLAYWRIGHT_MCP_HEADLESS,
+    STAGE1_FIELDS, STAGE2_FIELDS, STAGE3_FIELDS, GEO_FIELDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,7 @@ class AnalysisStageManager:
         self.mcp_client = None
         if ENABLE_WEB_SEARCH:
             try:
-                from mcp_client import MCPClientWrapper
+                from ..integrations.mcp_client import MCPClientWrapper
                 playwright_args = ["@playwright/mcp@latest", "--isolated"]
                 if PLAYWRIGHT_MCP_HEADLESS:
                     playwright_args.append("--headless")
@@ -293,9 +296,8 @@ class AnalysisStageManager:
                 if value != "1":
                     return False, {}, f"字段 {key} 的值不是 '1'，而是 '{value}'"
             
-            # 验证专业方向字段数量（最多5个，最少1个）
-            geo_fields = ['Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS']
-            marked_fields = [field for field in geo_fields if field in result and result[field] == "1"]
+            # 验证专业方向字段数量（最多3个，最少1个）
+            marked_fields = [field for field in GEO_FIELDS if field in result and result[field] == "1"]
             
             if len(marked_fields) == 0:
                 logger.info("第一遍分析未标记任何专业方向，尝试二次验证...")
@@ -309,8 +311,8 @@ class AnalysisStageManager:
                         return True, result, ""
                 
                 return False, {}, "可能不属于GIS领域"
-            elif len(marked_fields) > 5:
-                return False, {}, f"标记了{len(marked_fields)}个专业方向，超过最大限制5个"
+            elif len(marked_fields) > 3:
+                return False, {}, f"标记了{len(marked_fields)}个专业方向，超过最大限制3个"
             
             logger.info(f"阶段2分析成功，返回 {len(result)} 个字段: {list(result.keys())}")
             return True, result, ""
@@ -354,19 +356,8 @@ class AnalysisStageManager:
         """后处理分析结果，现在支持部分结果处理"""
         logger.info("开始后处理分析结果")
         
-        # 定义阶段1和阶段3的字段（这些字段如果不存在需要添加空值）
-        stage1_fields = ['Deadline', 'Number_Places', 'Direction', 'University_EN', 'Contact_Name', 'Contact_Email']
-        stage3_fields = ['University_CN', 'Country_CN', 'WX_Label1', 'WX_Label2', 'WX_Label3', 'WX_Label4', 'WX_Label5']
-        
-        # 阶段2的字段（只保留LLM返回的，不添加空值）
-        stage2_fields = [
-            'Master Student', 'Doctoral Student', 'PostDoc', 'Research Assistant', 
-            'Competition', 'Summer School', 'Conference', 'Workshop',
-            'Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS'
-        ]
-        
-        # 只为阶段1和阶段3的字段添加空值（如果不存在）
-        for field in stage1_fields + stage3_fields:
+        # 只为阶段1和阶段3的字段添加空值（如果不存在）；阶段2字段只保留 LLM 返回的，不补空值
+        for field in STAGE1_FIELDS + STAGE3_FIELDS:
             if field not in results:
                 results[field] = ""
         
@@ -423,11 +414,7 @@ class AnalysisStageManager:
                 results['Number_Places'] = ""
         
         # 确保阶段2的二进制字段只有"1"（只处理已存在的字段，不添加空字符串）
-        binary_fields = ['Master Student', 'Doctoral Student', 'PostDoc', 'Research Assistant',
-                        'Competition', 'Summer School', 'Conference', 'Workshop',
-                        'Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS']
-        
-        for field in binary_fields:
+        for field in STAGE2_FIELDS:
             if field in results:
                 value = str(results[field]).strip()
                 # 如果值不是"1"，则从结果中删除该字段（而不是设为空字符串）
@@ -508,3 +495,6 @@ if __name__ == "__main__":
     # 设置日志
     logging.basicConfig(level=logging.INFO)
     test_analysis_stage() 
+
+
+

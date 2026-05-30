@@ -25,7 +25,8 @@ class MCPClientManager:
     
     def __init__(self):
         self.sessions: Dict[str, ClientSession] = {}
-        self.server_params: Dict[str, StdioServerParameters] = {}
+        # stdio 连接存 StdioServerParameters；URL 连接存 {"command","url"} 字典。
+        self.server_params: Dict[str, Any] = {}
         self.exit_stack = AsyncExitStack()
         self._tools_cache: Dict[str, List[Any]] = {}
     
@@ -45,6 +46,8 @@ class MCPClientManager:
             # URL 连接 (args[0] 是 URL)
             # 优先使用 streamable HTTP，失败后回退到 SSE，提高兼容性。
             url = args[0]
+            # 记录连接方式，与 stdio 分支保持一致，便于排查。
+            self.server_params[name] = {"command": command, "url": url}
             timeout_seconds = 10.0
             transport = None
             last_error = None
@@ -247,12 +250,12 @@ class MCPClientWrapper:
         if self._initialized:
             return
         
-        # 创建事件循环
-        try:
-            self.loop = asyncio.get_event_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        # 创建并绑定独立事件循环。
+        # 不用 asyncio.get_event_loop()：它在 Python 3.10+ 无运行循环时会触发
+        # DeprecationWarning，且未来版本将移除该隐式行为。这里始终新建一个循环，
+        # 与同步包装器"独占一个循环跑到底"的用法一致。
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         
         # 创建管理器
         self.manager = MCPClientManager()
@@ -297,3 +300,6 @@ class MCPClientWrapper:
             except Exception as e:
                 logger.warning("[MCPClient] 清理阶段出现异常: %s", e)
             self._initialized = False
+
+
+

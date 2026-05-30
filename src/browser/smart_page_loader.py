@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 智能页面加载检测模块
@@ -400,4 +400,7 @@ def create_smart_loader(config: Optional[Dict] = None) -> SmartPageLoader:
         stability_threshold=config.get('stability_threshold', 3),
         min_content_length=config.get('min_content_length', 500)
     )
+
+
+
 

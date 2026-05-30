@@ -24,7 +24,7 @@ class PlaywrightProcessManager:
     
     def get_page_content(self, url: str, scroll_enabled: bool = True, timeout: int = 120) -> Optional[str]:
         """
-        通过独立进程获取页面内容
+        通过独立进程获取页面内容（仅返回纯文本，向后兼容旧调用）。
         
         Args:
             url: 要访问的URL
@@ -34,7 +34,31 @@ class PlaywrightProcessManager:
         Returns:
             str: 页面文本内容，失败返回None
         """
-        return self._run_playwright_task(url, scroll_enabled, False, timeout)
+        payload = self.get_page_payload(url, scroll_enabled, timeout)
+        if isinstance(payload, dict):
+            return payload.get('content')
+        return None
+
+    def get_page_payload(self, url: str, scroll_enabled: bool = True, timeout: int = 120) -> Optional[dict]:
+        """
+        通过独立进程获取页面完整载荷：纯文本 + 原始 HTML + 渲染后 innerText。
+
+        供下游"多候选打分择优"正文抽取使用（json-ld / trafilatura / og / innerText）。
+
+        Returns:
+            dict: {'content': str, 'html': str, 'inner_text': str}，失败返回None
+        """
+        result = self._run_playwright_task(url, scroll_enabled, False, timeout, return_full=True)
+        if isinstance(result, dict):
+            return {
+                'content': result.get('content'),
+                'html': result.get('html'),
+                'inner_text': result.get('inner_text'),
+            }
+        # 兼容旧返回（纯字符串）
+        if isinstance(result, str):
+            return {'content': result, 'html': None, 'inner_text': None}
+        return None
     
     def capture_screenshots(self, url: str, timeout: int = 120) -> Optional[list]:
         """
@@ -52,7 +76,7 @@ class PlaywrightProcessManager:
             return result.get('screenshots')
         return None
     
-    def _run_playwright_task(self, url: str, scroll_enabled: bool = True, screenshot_mode: bool = False, timeout: int = 120) -> Optional:
+    def _run_playwright_task(self, url: str, scroll_enabled: bool = True, screenshot_mode: bool = False, timeout: int = 120, return_full: bool = False) -> Optional:
         """
         通过独立进程运行Playwright任务（内部方法）
         
@@ -110,6 +134,8 @@ class PlaywrightProcessManager:
                         content = response.get('content')
                         length = response.get('length', 0)
                         logger.info(f"✅ Playwright进程成功获取内容，长度: {length} 字符")
+                        if return_full:
+                            return response
                         return content
                 else:
                     error = response.get('error', 'Unknown error')
@@ -154,4 +180,7 @@ def get_playwright_manager() -> PlaywrightProcessManager:
     if _playwright_manager is None:
         _playwright_manager = PlaywrightProcessManager()
     return _playwright_manager
+
+
+
 

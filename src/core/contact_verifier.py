@@ -9,9 +9,9 @@ import time
 from typing import Optional, Dict, List, Tuple
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
 
-from config import (REQUEST_TIMEOUT, MAX_RETRIES, CONTACT_VERIFICATION_ENABLED,
+from .config import (REQUEST_TIMEOUT, MAX_RETRIES, CONTACT_VERIFICATION_ENABLED,
                     CONTACT_SEARCH_TIMEOUT, MAX_SEARCH_RESULTS, MAX_PAGES_TO_ANALYZE)
-from utils import normalize_text, is_valid_url, clean_email_format
+from .utils import normalize_text, is_valid_url, clean_email_format
 
 logger = logging.getLogger(__name__)
 
@@ -1087,43 +1087,15 @@ Important notes:
     # ─────────────────────────────────────────────
 
     def _parse_json_list(self, text: str) -> list:
-        """从 LLM 返回文本中提取 JSON 数组"""
-        text = text.strip()
-        # 去掉 markdown 代码块
-        text = re.sub(r'^```[a-z]*\n?', '', text)
-        text = re.sub(r'\n?```$', '', text)
-        text = text.strip()
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
-        # 尝试从文本中找到 JSON 数组片段
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except Exception:
-                pass
-        return []
+        """从 LLM 返回文本中提取 JSON 数组（统一委托 utils）。"""
+        from .utils import extract_json_array
+        return extract_json_array(text)
 
     def _parse_json_obj(self, text: str) -> dict:
-        """从 LLM 返回文本中提取 JSON 对象"""
-        text = text.strip()
-        text = re.sub(r'^```[a-z]*\n?', '', text)
-        text = re.sub(r'\n?```$', '', text)
-        text = text.strip()
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except Exception:
-                pass
-        return {}
+        """从 LLM 返回文本中提取 JSON 对象（统一委托 utils，失败回退空 dict）。"""
+        from .utils import extract_json_object
+        res = extract_json_object(text)
+        return res if isinstance(res, dict) else {}
+
+
+

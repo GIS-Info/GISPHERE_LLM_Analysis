@@ -12,7 +12,7 @@ from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
-from config import (
+from ..core.config import (
     GOOGLE_CREDENTIALS_FILE, 
     GOOGLE_TOKEN_FILE, 
     GOOGLE_SPREADSHEET_ID, 
@@ -225,7 +225,7 @@ class GoogleSheetsHandler:
         Returns:
             tuple: (url, used_notes) - url为提取的链接，used_notes表示是否使用了Notes中的链接
         """
-        from utils import extract_url_from_text, is_valid_url
+        from ..core.utils import extract_url_from_text, is_valid_url
         
         # 优先从Source中获取链接
         source = row_data.get('Source', '')
@@ -464,28 +464,8 @@ class GoogleSheetsHandler:
         except ValueError:
             return False
 
-def validate_analysis_result(result: Dict, stage: str) -> bool:
-    """验证分析结果的格式"""
-    if not isinstance(result, dict):
-        logger.error(f"{stage} 分析结果不是字典格式")
-        return False
-    
-    # 定义每个阶段应该包含的字段
-    stage_fields = {
-        'stage1': ['Deadline', 'Number_Places', 'Direction', 'University_EN', 'Contact_Name', 'Contact_Email'],
-        'stage2': ['Master Student', 'Doctoral Student', 'PostDoc', 'Research Assistant', 
-                  'Competition', 'Summer School', 'Conference', 'Workshop',
-                  'Physical_Geo', 'Human_Geo', 'Urban', 'GIS', 'RS', 'GNSS'],
-        'stage3': ['University_CN', 'Country_CN', 'WX_Label1', 'WX_Label2', 'WX_Label3', 'WX_Label4', 'WX_Label5']
-    }
-    
-    expected_fields = stage_fields.get(stage, [])
-    
-    # 检查必要字段是否存在
-    missing_fields = [field for field in expected_fields if field not in result]
-    if missing_fields:
-        logger.error(f"{stage} 分析结果缺少字段: {missing_fields}")
-        return False
-    
-    logger.info(f"{stage} 分析结果格式验证通过")
-    return True 
+# 注：分析结果字段校验 validate_analysis_result 统一定义在 ingestion/excel_handler.py，
+# 此处此前有一份完全重复的副本（无人引用），已删除以避免双份维护。
+
+
+

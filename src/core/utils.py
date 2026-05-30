@@ -17,15 +17,28 @@ def check_dependencies():
     """检查依赖包是否已安装"""
     # 包名映射：pip包名 -> 导入名
     package_mapping = {
-        'openai': 'openai',
-        'requests': 'requests', 
+        'requests': 'requests',
         'pandas': 'pandas',
+        'numpy': 'numpy',
         'openpyxl': 'openpyxl',
-        'beautifulsoup4': 'bs4',  # beautifulsoup4 包导入时使用 bs4
-        'PyMuPDF': 'fitz',        # PyMuPDF 包导入时使用 fitz
+        'beautifulsoup4': 'bs4',
+        'PyMuPDF': 'fitz',
+        'pdfplumber': 'pdfplumber',
+        'PyPDF2': 'PyPDF2',
+        'pytesseract': 'pytesseract',
+        'Pillow': 'PIL',
+        'playwright': 'playwright',
+        'mcp': 'mcp',
+        'google-api-python-client': 'googleapiclient',
+        'google-auth-httplib2': 'google_auth_httplib2',
+        'google-auth': 'google.auth',
+        'google-auth-oauthlib': 'google_auth_oauthlib',
+        'inflect': 'inflect',
         'tqdm': 'tqdm',
         'urllib3': 'urllib3',
-        'lxml': 'lxml'
+        'lxml': 'lxml',
+        'trafilatura': 'trafilatura',
+        'lxml_html_clean': 'lxml_html_clean',
     }
     
     missing_packages = []
@@ -250,7 +263,7 @@ def sanitize_filename(filename):
 
 def save_llm_conversation(row_index, conversation_data):
     """保存LLM对话记录"""
-    from config import LLM_LOG_DIR
+    from .config import LLM_LOG_DIR
     import datetime as dt
     
     # 使用英国时间(UTC)生成文件名，精确到秒
@@ -391,11 +404,55 @@ def validate_json_response(response_text):
         logger.error(f"响应内容: {response_text[:500]}...")
         return None
 
+def extract_json_object(response_text):
+    """解析 LLM 输出中的 JSON 对象，失败返回 None。
+
+    与 validate_json_response 等价（后者为历史名称，供三阶段分析使用）；
+    这里提供语义更清晰的别名，供 verifier 等模块复用同一套健壮解析逻辑。
+    """
+    return validate_json_response(response_text)
+
+
+def extract_json_array(response_text):
+    """解析 LLM 输出中的 JSON 数组，失败返回空列表 []。
+
+    validate_json_response 只针对对象；MCP 搜索结果等场景返回的是数组，
+    因此单独提供数组解析（剥离 markdown 围栏后整体解析，再回退到 [...] 片段匹配）。
+    """
+    if not response_text:
+        return []
+    try:
+        text = response_text.strip()
+        # 去掉 markdown 代码块围栏
+        text = re.sub(r'^```[a-z]*\n?', '', text)
+        text = re.sub(r'\n?```$', '', text)
+        text = text.strip()
+
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                if isinstance(data, list):
+                    return data
+            except json.JSONDecodeError:
+                pass
+    except Exception as e:
+        logger.debug(f"JSON 数组解析异常: {e}")
+    return []
+
+
 def check_ollama_availability():
     """检查Ollama是否可用"""
     try:
         import requests
-        from config import OLLAMA_BASE_URL
+        from .config import OLLAMA_BASE_URL
         
         response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         return response.status_code == 200
@@ -468,3 +525,6 @@ def normalize_text(text):
     text = text.strip()
     
     return text 
+
+
+
