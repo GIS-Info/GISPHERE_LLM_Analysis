@@ -62,6 +62,7 @@ class ContentFetcher:
         # 存储当前处理的PDF文件路径，用于后续清理
         self.current_pdf_file = None
         self.last_fetch_summary = {}
+        self._last_http_challenge = False
         
         # 初始化截图OCR提取器
         self.screenshot_ocr_fetcher = None
@@ -76,8 +77,25 @@ class ContentFetcher:
         except Exception as e:
             logger.warning(f"截图OCR提取器初始化失败: {e}")
 
+        # browser-use 智能代理兜底（回退链最后一级，仅在前面全部失败后触发）
+        self.browser_agent_enabled = False
+        try:
+            from ..core.config import USE_BROWSER_AGENT
+            if USE_BROWSER_AGENT:
+                from .browser_agent_fetcher import is_browser_agent_available
+                self.browser_agent_enabled = is_browser_agent_available()
+                if self.browser_agent_enabled:
+                    logger.info("✅ browser-use 智能代理兜底已启用")
+                else:
+                    logger.warning("browser-use 不可用（未安装或缺少 API Key），智能代理兜底关闭")
+            else:
+                logger.info("browser-use 智能代理兜底已在配置中禁用")
+        except Exception as e:
+            logger.warning(f"browser-use 智能代理兜底初始化失败: {e}")
+
     def _reset_last_fetch_summary(self, url: str):
         """重置最近一次抓取摘要。"""
+        self._last_http_challenge = False  # HTTP 层是否检测到反爬验证（Cloudflare 等）
         self.last_fetch_summary = {
             "url": url,
             "content_type": None,
@@ -221,14 +239,21 @@ class ContentFetcher:
         if self.screenshot_ocr_fetcher and self.playwright_manager:
             strategy.append("ocr")
 
+        if self.browser_agent_enabled:
+            strategy.append("browser_agent")
+
         logger.info(f"网页抓取策略: {strategy} ({url})")
         return strategy
 
     def _fetch_web_content_with_strategy(self, url: str) -> Optional[str]:
         """按统一策略链抓取网页内容，并基于内容质量逐级升级抓取方式。"""
         attempts: List[FetchAttemptResult] = []
+        strategy = self._get_web_fetch_strategy(url)
+        skip_methods: set = set()
 
-        for method in self._get_web_fetch_strategy(url):
+        for method in strategy:
+            if method in skip_methods:
+                continue
             attempt = self._run_web_fetch_attempt(url, method)
             attempts.append(attempt)
             self._record_fetch_attempt(attempt)
@@ -237,6 +262,15 @@ class ContentFetcher:
                 f"抓取尝试[{method}] 质量={attempt.quality}, 分数={attempt.score}, "
                 f"标记={attempt.flags if attempt.flags else ['ok']}, 原因={attempt.reason}"
             )
+
+            if method == "http" and ("challenge_page" in attempt.flags or self._last_http_challenge):
+                # HTTP 层已确认反爬验证页：Playwright/截图 OCR 注定拿不到正文，
+                # 反而会以机器人特征反复访问、加重站点的反爬升级；
+                # 直接交给 browser-use 代理（保持站点只见过一次轻量访问）
+                if "browser_agent" in strategy:
+                    logger.warning("⚠️  HTTP 层检测到反爬验证页，跳过 Playwright/截图 OCR，直接使用 browser-use 代理兜底")
+                    skip_methods.update({"playwright", "ocr"})
+                    continue
 
             if "pdf_like_content" in attempt.flags:
                 logger.warning("⚠️  检测到网页内容疑似PDF乱码，切换到PDF处理流程")
@@ -251,6 +285,12 @@ class ContentFetcher:
                 return pdf_content
 
             if "challenge_page" in attempt.flags and method == "playwright":
+                # 验证页截图 OCR 只会得到验证页文字，直接跳过；
+                # browser-use 代理能等待/通过验证，保留这一级
+                if "browser_agent" in strategy:
+                    logger.warning("⚠️  Playwright 被验证页阻塞，跳过截图 OCR，交给 browser-use 代理兜底")
+                    skip_methods.add("ocr")
+                    continue
                 logger.error("❌ Playwright 仍被验证页阻塞，停止继续升级到 OCR")
                 break
 
@@ -297,6 +337,8 @@ class ContentFetcher:
             content = self._fetch_web_content_with_playwright(url)
         elif method == "ocr":
             content = self._fetch_content_with_screenshot_ocr(url)
+        elif method == "browser_agent":
+            content = self._fetch_content_with_browser_agent(url)
         else:
             logger.warning(f"未知抓取方式: {method}")
             content = None
@@ -704,7 +746,19 @@ class ContentFetcher:
         except Exception as e:
             logger.error(f"截图OCR处理失败: {e}")
             return None
-    
+
+    def _fetch_content_with_browser_agent(self, url: str) -> Optional[str]:
+        """使用 browser-use 智能代理获取内容（回退链最后一级兜底，委托 browser_agent_fetcher）。"""
+        if not self.browser_agent_enabled:
+            logger.warning("browser-use 智能代理未启用")
+            return None
+        try:
+            from .browser_agent_fetcher import fetch_with_browser_agent
+            return fetch_with_browser_agent(url)
+        except Exception as e:
+            logger.error(f"browser-use 智能代理处理失败: {e}")
+            return None
+
     def _download_with_retry(self, url: str, timeout: int) -> Optional[requests.Response]:
         """带重试的下载功能"""
         for attempt in range(MAX_RETRIES):
@@ -727,6 +781,19 @@ class ContentFetcher:
                 logger.warning(f"连接错误 (第{attempt + 1}次): {url}")
             except requests.exceptions.HTTPError as e:
                 logger.warning(f"HTTP错误 (第{attempt + 1}次): {e}")
+                resp = e.response
+                status = resp.status_code if resp is not None else None
+                # Cloudflare 等反爬验证的典型特征：403/503 + cloudflare 标头
+                if resp is not None and status in (403, 503):
+                    server = resp.headers.get("server", "").lower()
+                    if "cloudflare" in server or "cf-ray" in resp.headers:
+                        self._last_http_challenge = True
+                        logger.warning("检测到反爬验证特征（Cloudflare），停止 HTTP 重试")
+                        return None
+                # 4xx 客户端错误（限流/超时类除外）重试无意义，且重复访问会加重反爬升级
+                if status is not None and 400 <= status < 500 and status not in (408, 429):
+                    logger.info(f"客户端错误 {status}，跳过剩余重试")
+                    return None
             except Exception as e:
                 logger.warning(f"下载失败 (第{attempt + 1}次): {e}")
             

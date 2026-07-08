@@ -250,6 +250,17 @@ def check_system_tools():
         logger.warning("⚠️  pytesseract 未安装")
         ok = False
 
+    # browser-use（抓取回退链最后一级智能代理兜底；需 Python >= 3.11）
+    try:
+        import browser_use  # noqa: F401
+        logger.info("✅ browser-use 已安装（智能代理兜底可用）")
+        if sys.platform == "win32" and not sys.flags.utf8_mode:
+            logger.info("   提示: 建议设置 PYTHONUTF8=1，避免 browser-use 在 GBK 环境下的编码错误")
+    except ImportError:
+        logger.warning("⚠️  browser-use 未安装（疑难页面的智能代理兜底不可用）")
+        logger.info("   请运行: pip install browser-use（需 Python >= 3.11）")
+        ok = False
+
     # Playwright Chromium
     try:
         from playwright.sync_api import sync_playwright
@@ -332,6 +343,7 @@ def check_contact_verification():
 def main():
     """主检查函数"""
     logger.info("开始系统检查...")
+    logger.info(f"Python: {sys.version.split()[0]} ({sys.executable})")
     logger.info("=" * 60)
     
     checks = [

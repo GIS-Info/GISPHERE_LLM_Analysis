@@ -1,7 +1,7 @@
 # 可用模型清单（Available Models）
 
-<!-- generated: 2026-05-30 -->
-> 自动生成于 **2026-05-30**，数据来源：[New API 网关定价](https://newapi.gisphere.info/api/pricing)。
+<!-- generated: 2026-07-08 -->
+> 自动生成于 **2026-07-08**，数据来源：[New API 网关定价](https://newapi.gisphere.info/api/pricing)。
 > 每月首次运行主流程时会自动刷新；也可手动运行 `python -m src.tools.update_models`。
 > 项目总览与 LLM 配置说明见 [README.md](README.md#-llm-配置)。
 
@@ -15,8 +15,8 @@
 ## 当前默认模型链（config.py）
 
 ```python
-TEXT_MODEL_CHAIN = ['gpt-5.4-mini', 'gemini-2.5-flash', 'claude-opus-4.5']
-VISION_MODEL_CHAIN = ['gpt-5.4-mini', 'gemini-2.5-flash', 'claude-opus-4.5']
+TEXT_MODEL_CHAIN = ['claude-opus-4-5', 'gpt-5.5', 'gemini-3.5-flash']
+VISION_MODEL_CHAIN = ['claude-opus-4-5', 'gpt-5.5', 'gemini-3.5-flash']
 ```
 
 > 以上为生成时自 `config.py` 读取的快照；修改模型链后重新运行 `python -m src.tools.update_models` 可刷新本节。
@@ -35,11 +35,11 @@ VISION_MODEL_CHAIN = ['gpt-5.4-mini', 'gemini-2.5-flash', 'claude-opus-4.5']
 
 | 模型 | 平台 | 输入 $/1M | 输出 $/1M | 备注 |
 |:---|:---|---:|---:|:---|
-| `gpt-5-mini` | OpenAI | 0.040 | 0.320 |  |
 | `gpt-4.1-nano` | OpenAI | 0.100 | 0.400 |  |
 | `gpt-4o-mini` | OpenAI | 0.150 | 0.600 |  |
 | `gpt-5.4-nano` | OpenAI | 0.200 | 1.250 |  |
 | `gemini-3.1-flash-lite` | Google | 0.250 | 1.500 | 端点: gemini, openai |
+| `gpt-5-mini` | OpenAI | 0.250 | 2.000 |  |
 | `gemini-2.5-flash` | Google | 0.300 | 2.500 | 端点: gemini, openai |
 | `gpt-4.1-mini` | OpenAI | 0.400 | 1.600 |  |
 | `gemini-3-flash` | Google | 0.500 | 3.000 | 端点: gemini, openai |
@@ -54,10 +54,10 @@ VISION_MODEL_CHAIN = ['gpt-5.4-mini', 'gemini-2.5-flash', 'claude-opus-4.5']
 | `gpt-4o` | OpenAI | 2.500 | 10.000 |  |
 | `gpt-5.4` | OpenAI | 2.500 | 15.000 |  |
 | `mistral-document-ai-2512` | Mistral | 3.000 | 9.000 |  |
-| `claude-opus-4.5` | Anthropic | 5.000 | 25.000 | 端点: anthropic, openai |
+| `claude-opus-4-5` | Anthropic | 5.000 | 25.000 | 端点: anthropic, openai |
 | `gpt-5.5` | OpenAI | 5.000 | 30.000 |  |
 
-## 其他模型（7 个，仅文本 / embedding / 生图等）
+## 其他模型（10 个，仅文本 / embedding / 生图等）
 
 不适合作为 `VISION_MODEL_CHAIN` 候选；embedding 与纯生图模型不可用于对话式多模态输入。
 
@@ -69,10 +69,13 @@ VISION_MODEL_CHAIN = ['gpt-5.4-mini', 'gemini-2.5-flash', 'claude-opus-4.5']
 |:---|:---|---:|---:|:---|
 | `text-embedding-3-small` | OpenAI | 0.020 | 0.020 |  |
 | `text-embedding-3-large` | OpenAI | 0.130 | 0.130 |  |
+| `deepseek-v4-flash` | DeepSeek | 0.190 | 0.510 |  |
 | `model-router` | 其他 | 0.750 | 4.500 |  |
 | `kimi-k2.6` | Moonshot | 0.950 | 4.000 |  |
-| `deepseek-v4-flash` | DeepSeek | 1.030 | 4.120 |  |
+| `deepseek-v4-pro` | DeepSeek | 1.740 | 3.480 |  |
+| `gpt-chat-latest` | OpenAI | 5.000 | 30.000 |  |
+| `DeepSeek-V3.1` | DeepSeek | 75.000 | 75.000 |  |
 | `gpt-image-2` | OpenAI | 75.000 | 150.000 |  |
 | `imagen-4.0-generate-001` | 其他 | 75.000 | 75.000 | 端点: image-generation, gemini, openai |
 
-> 共 **28** 个模型：多模态 **21** 个，其他 **7** 个。
+> 共 **31** 个模型：多模态 **21** 个，其他 **10** 个。

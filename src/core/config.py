@@ -2,8 +2,22 @@
 项目配置文件
 """
 import os
+import sys
 import logging
 from pathlib import Path
+
+# Python 版本门槛：browser-use（抓取回退链兜底）要求 3.11+。
+# 低版本下 browser-use 无法安装，系统会静默降级、疑难页面全部失败，
+# 因此在最早的导入点直接终止并提示，而不是带病运行。
+MIN_PYTHON = (3, 11)
+if sys.version_info < MIN_PYTHON:
+    raise SystemExit(
+        f"\n❌ Python 版本过低: 当前 {sys.version_info.major}.{sys.version_info.minor}."
+        f"{sys.version_info.micro}（{sys.executable}）\n"
+        f"   本项目要求 Python >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+        f"（browser-use 智能代理兜底的最低要求）。\n"
+        f"   请切换解释器后重试，例如: conda activate py311\n"
+    )
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +77,18 @@ SCREENSHOT_QUALITY = 100  # 截图质量 (1-100, 注意: PNG格式不使用此�
 SCREENSHOT_MAX_PAGES = 10  # 长页面最大截图页数
 SCREENSHOT_CLEANUP_AFTER_USE = True  # 使用后是否自动清理截图
 
+# browser-use 智能浏览器代理配置（网页抓取回退链的最后一级兜底）
+# 仅在 HTTP / Playwright / 截图OCR 全部失败后触发，用 LLM 驱动浏览器完成
+# 多步交互（过验证页、关弹窗、展开内容）后提取正文。成本较高（单 URL 约
+# 1.6万–6.3万 token），因此只做兜底。设环境变量 USE_BROWSER_AGENT=0 可关闭。
+USE_BROWSER_AGENT = os.getenv("USE_BROWSER_AGENT", "1").lower() in ("1", "true", "yes", "on")
+BROWSER_AGENT_MODEL = "gpt-5.5"   # 2026-07-08 实测：网关上该模型对 browser-use 的工具调用最稳
+BROWSER_AGENT_MAX_STEPS = 12      # 单任务最大代理步数（成本上限）
+BROWSER_AGENT_TIMEOUT = 300       # 单 URL 兜底总超时（秒）
+# 网关 nginx 对含整页截图的大请求体返回 413，故禁用视觉、仅用 DOM 文本；
+# 若网关调大 client_max_body_size 后可改为 True
+BROWSER_AGENT_USE_VISION = False
+
 # PDF 查看器（腾讯文档等）逐页截图配置
 # 按页码逐页裁剪，确保每张截图恰好是完整一页（不会上一页一半下一页一半）
 PDF_VIEWER_PER_PAGE_CLIP = True   # 启用逐页 clip 截图策略
@@ -78,20 +104,21 @@ SCREENSHOT_SCROLL_WAIT_MS = 250   # 每次滚动后的等待（毫秒）
 API_BASE_URL = "https://newapi.gisphere.info/v1"
 GEMINI_BASE_URL = "https://newapi.gisphere.info/v1beta"
 
-# === LLM 模型路由链（价格由低到高，运行时逐个回退；统一走 /chat/completions）===
+# === LLM 模型路由链（按效果/偏好排序，运行时逐个回退；统一走 /chat/completions）===
 # 纯文本三阶段分析使用。任一模型不可用（401/403/404/限流）时自动尝试下一个。
-# 价格参考 https://newapi.gisphere.info/about，可由 MODELS.md 生成器定期刷新后手动调整。
-# 价格顺序依据 MODELS.md（网关实测定价，$/1M tokens 输入价）。
+# 顺序依据 2026-06-28 线上抽样实测：claude-sonnet-4-6 最快最稳，gpt-5.5 可用但更慢。
+# 注意：gemini-3.5-flash 当前因上游 Google key 被停用（"Consumer ... has been suspended"）
+#       会返回 403，作为最后兜底保留，待上游恢复后自动重新生效。
 TEXT_MODEL_CHAIN = [
-    "gpt-5.4-mini",
-    "gemini-2.5-flash",
-    "claude-opus-4.5",
+    "claude-opus-4-5",
+    "gpt-5.5",
+    "gemini-3.5-flash",
 ]
-# 图片/文档（VLM）使用：仅含支持视觉输入的模型，同样价格升序。
+# 图片/文档（VLM）使用：仅含支持视觉输入的模型，同序。
 VISION_MODEL_CHAIN = [
-    "gpt-5.4-mini",
-    "gemini-2.5-flash",  
-    "claude-opus-4.5", 
+    "claude-opus-4-5",
+    "gpt-5.5",
+    "gemini-3.5-flash",
 ]
 
 # 向后兼容的单值别名（旧模块/日志仍引用）

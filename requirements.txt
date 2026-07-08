@@ -1,11 +1,11 @@
 # =============================================================================
-# LLM Analysis — Python dependencies
+# LLM Analysis - Python dependencies
 #
 # Install:
 #   python -m pip install -r requirements.txt
 #   python -m playwright install chromium
 #
-# System tools (NOT installed via pip — see README):
+# System tools (NOT installed via pip - see README):
 #   - Node.js + npx          MCP contact/direction search (npx @playwright/mcp)
 #   - Tesseract OCR          pytesseract fallback; need eng + chi_sim language packs
 #   - Playwright Chromium    installed by command above
@@ -45,7 +45,10 @@ Pillow>=10.0.0
 # Browser automation (dynamic pages, PDF viewers, Playwright worker)
 playwright>=1.40.0
 
-# MCP client (Playwright MCP — requires Node.js npx at runtime)
+# LLM-driven browser agent (last-tier fetch fallback; requires Python >= 3.11)
+browser-use>=0.13.0
+
+# MCP client (Playwright MCP - requires Node.js npx at runtime)
 mcp>=1.9.0
 
 # Google Sheets API
@@ -58,6 +61,6 @@ google-auth>=2.17.0
 inflect>=6.0.0
 
 # -----------------------------------------------------------------------------
-# Optional — OCR image preprocessing; skipped automatically if not installed
+# Optional - OCR image preprocessing; skipped automatically if not installed
 # -----------------------------------------------------------------------------
 # opencv-python>=4.8.0

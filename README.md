@@ -6,14 +6,14 @@
 
 ### 环境要求
 
-- **Python**: 推荐 3.10+
+- **Python**: **3.11+**（`browser-use` 智能代理兜底的最低要求）。程序启动时会强制校验版本，低于 3.11 会直接终止并提示切换解释器。**注意 IDE / 终端里实际使用的解释器**：用旧环境（如 conda `py310`）运行时 browser-use 会静默降级为不可用（v3.2 起直接拒绝启动）
 - **New API 网关**: `https://newapi.gisphere.info/v1`
-- **Python 依赖**: 见 [`requirements.txt`](requirements.txt)（含 `trafilatura`、`lxml_html_clean` 等；**无需** `openai` SDK，LLM 调用走 `requests`）
+- **Python 依赖**: 见 [`requirements.txt`](requirements.txt)（含 `trafilatura`、`lxml_html_clean`、`browser-use` 等；主流水线的 LLM 调用走 `requests`，`openai` SDK 仅作为 browser-use 的依赖间接安装）
 - **系统工具**（不通过 pip 安装，需单独配置）:
   - **Node.js + npx**: 联系人/方向验证的 Playwright MCP 依赖 `npx @playwright/mcp`（见 `analysis_stage.py`）
   - **Tesseract OCR**: `pytesseract` 回退路径；需安装 **`eng` + `chi_sim`** 语言包（与 `OCR_LANGUAGE = 'eng+chi_sim'` 一致）
   - **Playwright Chromium**: 动态网页、PDF 预览器截图
-- **可选**: Ollama 本地模型（无 API Key 时回退）；`opencv-python`（OCR 图像预处理，未安装时自动跳过）
+- **可选**: Ollama 本地模型（无 API Key 时回退）；`opencv-python`（OCR 图像预处理，未安装时自动跳过）；正式版 Google Chrome（browser-use 优先使用，过反爬验证成功率更高；缺失时回退 Playwright Chromium）
 
 ### 安装步骤
 
@@ -66,7 +66,7 @@ python -m src.tools.update_models
 
 ### 内容提取能力
 
-- **多种获取方式**: HTTP、Playwright 动态渲染、PDF 解析、VLM 文档提取、Tesseract OCR
+- **多种获取方式**: HTTP、Playwright 动态渲染、PDF 解析、VLM 文档提取、Tesseract OCR、browser-use 智能代理
 - **智能页面加载**: 网络空闲、关键元素、内容/高度稳定性等多策略（`smart_page_loader`）
 - **打分式正文抽取**: JSON-LD / trafilatura / og:description / innerText 多路候选择优（`content_extractor`）
 - **逐页 PDF 截图**: 在线 PDF 预览器按页裁剪，保证每张恰好一页
@@ -120,6 +120,7 @@ src/
     google_sources.py    # Google Drive / Docs 处理
     document_ai.py       # VLM 图片/PDF 文字提取
     screenshot_ocr_fetcher.py
+    browser_agent_fetcher.py # browser-use 智能代理兜底（回退链最后一级）
   integrations/
     google_sheets_handler.py
     mcp_client.py        # Playwright MCP 客户端
@@ -160,6 +161,10 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 | `USE_PLAYWRIGHT` | `True` | 是否启用 Playwright 子进程抓取 |
 | `USE_DOCUMENT_AI` | `True` | 是否优先 VLM 提取 PDF/图片文字 |
 | `USE_SCREENSHOT_OCR` | `True` | 是否在常规提取失败后截图 OCR |
+| `USE_BROWSER_AGENT` | `True` | 是否启用 browser-use 智能代理兜底（可用环境变量 `USE_BROWSER_AGENT=0` 覆盖） |
+| `BROWSER_AGENT_MODEL` | `gpt-5.5` | 代理所用模型（走同一 New API 网关） |
+| `BROWSER_AGENT_MAX_STEPS` | `12` | 单任务最大代理步数（成本上限） |
+| `BROWSER_AGENT_USE_VISION` | `False` | 是否给代理发截图；网关 nginx 对大请求体返回 413，默认纯 DOM 文本 |
 | `CONTACT_VERIFICATION_ENABLED` | `True` | 是否执行联系人验证流程 |
 | `OCR_LANGUAGE` | `eng+chi_sim` | Tesseract 语言；需安装对应语言包 |
 
@@ -179,6 +184,7 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 1. HTTP + 打分式正文抽取（`content_extractor`）
 2. Playwright 动态渲染 + 再抽取
 3. 长页/难页截图 → VLM（`document_ai`）→ Tesseract OCR
+4. **browser-use 智能代理兜底**（`browser_agent_fetcher`）：LLM 驱动浏览器多步交互（等验证页、关弹窗、展开内容）后提取正文；仅在前面全部失败后触发（Playwright 检测到验证页时跳过第 3 级直达本级）。单 URL 约 1.6万–6.3万 token，成本原因只做兜底
 
 **直链 PDF**
 
@@ -271,6 +277,8 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 | `PLAYWRIGHT_HEADLESS` | `0` | 主 Playwright worker 是否无头；默认有头 |
 | `MODEL_COOLDOWN_SECONDS` | `1800` | 模型 401/403 熔断秒数 |
 | `FORCE_IPV4` | `true` | 强制 IPv4（`src/main.py`） |
+| `USE_BROWSER_AGENT` | `1` | `0` = 禁用 browser-use 智能代理兜底 |
+| `PYTHONUTF8` | 未设 | Windows 建议设为 `1`：browser-use 在 GBK 默认编码下写文件遇 `\xa0` 等字符会报错 |
 
 ## 🛠️ 常见问题
 
@@ -303,6 +311,8 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 
 | 现象 | 可能原因 | 处理建议 |
 |------|----------|----------|
+| 启动即报「Python 版本过低」 | 用了 3.11 以下的解释器（如 conda `py310`） | 切换到 3.11+ 环境（如 `conda activate py311`）后重跑；报错信息里会显示当前解释器路径 |
+| 日志出现「browser-use 不可用」 | 当前解释器未安装 browser-use | 在当前环境 `pip install browser-use`（需 Python ≥ 3.11） |
 | LLM 401/403 | Key 或模型不可用 | 检查 `keys/api_key.txt`、[`MODELS.md`](MODELS.md)；等熔断或换链 |
 | 模型被跳过 | 熔断中 | 调整链或等 `MODEL_COOLDOWN_SECONDS` |
 | 网页正文极少 | 登录墙/反爬 | `PLAYWRIGHT_HEADLESS=0`；LinkedIn 等可能只有摘要 |
@@ -316,6 +326,13 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 **排错顺序**：`llm_logs/row_*.txt` → `logs/run.log` → `python -m src.tools.check_system`
 
 ## 🗓️ 更新日志
+
+### v3.2 - 2026-07
+
+- ✅ 新增 browser-use 智能代理兜底（回退链第 4 级）：LLM 驱动浏览器过验证页/关弹窗后提取正文；实测将 3 个「内容获取失败」URL 全部救回
+- ✅ Playwright 遇验证页时不再直接放弃，跳过截图 OCR 交给智能代理
+- ✅ 反爬友好化：HTTP 层检测到 Cloudflare 验证页时直接短路到智能代理（避免 Playwright/OCR 重复访问加重反爬升级）；403 等客户端错误不再重试；browser-use 优先使用本机正式版 Chrome（指纹更可信）
+- ⚠️ Python 最低要求提升到 3.11（browser-use 依赖）；启动时强制校验版本，低版本直接终止并提示切换解释器（防止静默降级）
 
 ### v3.1 - 2026-05
 
