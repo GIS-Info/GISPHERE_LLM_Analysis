@@ -96,11 +96,30 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
         dict: {'success': bool, 'content': str, 'error': str, 'screenshots': list}
     """
     try:
-        from playwright.sync_api import sync_playwright
         from bs4 import BeautifulSoup
-        
+
         logger.info(f"Playwright Worker: 开始处理 {url}")
-        
+
+        # 引擎选择：优先 patchright（打了隐身补丁的 Playwright，运行时消除 CDP/自动化指纹）
+        # + 真 Chrome，反检测能力最强；缺 patchright 或找不到真 Chrome 时，回退标准
+        # playwright + 捆绑 chromium（保持原有行为）。
+        chrome_exe = None
+        try:
+            from ..ingestion.browser_agent_fetcher import _find_browser_executable
+            chrome_exe = _find_browser_executable()
+        except Exception:
+            chrome_exe = None
+        use_patchright = False
+        if chrome_exe:
+            try:
+                from patchright.sync_api import sync_playwright
+                use_patchright = True
+                logger.info(f"使用 patchright（隐身补丁）+ 真 Chrome 启动: {chrome_exe}")
+            except ImportError:
+                from playwright.sync_api import sync_playwright
+        else:
+            from playwright.sync_api import sync_playwright
+
         # 读取 headless 配置（默认有头，降低反爬触发；可用环境变量覆盖）
         try:
             from ..core.config import PLAYWRIGHT_HEADLESS
@@ -109,19 +128,23 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             headless_mode = False
 
         with sync_playwright() as p:
-            # 启动浏览器（headless 由配置决定）
-            browser = p.chromium.launch(
-                headless=headless_mode,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process'
-                ]
-            )
+            if use_patchright:
+                # patchright 用真 Chrome，且刻意不加暴露自动化的启动参数（由补丁负责隐身）
+                browser = p.chromium.launch(headless=headless_mode, channel="chrome")
+            else:
+                # 标准 playwright + 捆绑 chromium（原有行为）
+                browser = p.chromium.launch(
+                    headless=headless_mode,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--no-first-run',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process'
+                    ]
+                )
             
             # 创建浏览器上下文
             context = browser.new_context(

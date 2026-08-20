@@ -18,6 +18,9 @@
 # Core HTTP/API (New API gateway via requests; no openai SDK)
 requests>=2.31.0
 urllib3>=2.0.0
+# Browser TLS/JA3 impersonation — bypasses TLS-fingerprint anti-bot (fetch tier
+# between plain HTTP and Playwright). Also used for ATS direct-JSON connect.
+curl_cffi>=0.7.0
 
 # Data processing
 pandas>=2.0.0
@@ -44,6 +47,10 @@ Pillow>=10.0.0
 
 # Browser automation (dynamic pages, PDF viewers, Playwright worker)
 playwright>=1.40.0
+# Stealth drop-in for Playwright (removes CDP/automation fingerprints; better at
+# passing Cloudflare). Reuses installed Google Chrome (channel="chrome"), so no
+# separate `patchright install chromium` needed when real Chrome is present.
+patchright>=1.40.0
 
 # LLM-driven browser agent (last-tier fetch fallback; requires Python >= 3.11)
 browser-use>=0.13.0
