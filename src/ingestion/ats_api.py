@@ -172,6 +172,61 @@ def _fetch_workday(url: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Ashby
+# ──────────────────────────────────────────────────────────────────
+def _fetch_ashby(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    segments = [s for s in parsed.path.split("/") if s]
+    if len(segments) < 2:
+        return None  # 仅有 job board 列表页，无法定位单条职位
+    org, job_id = segments[0], segments[1]
+    board = _get_json(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true")
+    if not board:
+        return None
+    job = next((j for j in (board.get("jobs") or []) if j.get("id") == job_id), None)
+    if not job:
+        return None
+    return _join([
+        job.get("title"),
+        f"Location: {job.get('location')}" if job.get("location") else None,
+        f"Type: {job.get('employmentType')}" if job.get("employmentType") else None,
+        f"Department: {job.get('department')}" if job.get("department") else None,
+        job.get("descriptionPlain") or _html_to_text(job.get("descriptionHtml")),
+    ]) or None
+
+
+# ──────────────────────────────────────────────────────────────────
+# SmartRecruiters
+# ──────────────────────────────────────────────────────────────────
+def _fetch_smartrecruiters(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    segments = [s for s in parsed.path.split("/") if s]
+    if len(segments) < 2:
+        return None
+    company = segments[0]
+    # 第二段形如 {postingId}-{slug}，postingId 为纯数字
+    m = re.match(r"(\d+)", segments[1])
+    if not m:
+        return None
+    posting_id = m.group(1)
+    data = _get_json(f"https://api.smartrecruiters.com/v1/companies/{company}/postings/{posting_id}")
+    if not data:
+        return None
+    loc = data.get("location") or {}
+    loc_str = ", ".join(x for x in [loc.get("city"), loc.get("country")] if x)
+    sections = (data.get("jobAd") or {}).get("sections") or {}
+    section_text = []
+    for sec in sections.values():
+        if isinstance(sec, dict):
+            section_text.append(_join([sec.get("title"), _html_to_text(sec.get("text"))]))
+    return _join([
+        data.get("name"),
+        f"Location: {loc_str}" if loc_str else None,
+        _join(section_text),
+    ]) or None
+
+
+# ──────────────────────────────────────────────────────────────────
 # 分发
 # ──────────────────────────────────────────────────────────────────
 def detect_ats_kind(url: str) -> Optional[str]:
@@ -181,8 +236,12 @@ def detect_ats_kind(url: str) -> Optional[str]:
         return "workday"
     if "greenhouse.io" in host:
         return "greenhouse"
-    if "jobs.lever.co" in host or "lever.co" in host:
+    if "lever.co" in host:
         return "lever"
+    if "ashbyhq.com" in host:
+        return "ashby"
+    if "smartrecruiters.com" in host:
+        return "smartrecruiters"
     return None
 
 
@@ -190,6 +249,8 @@ _DISPATCH = {
     "workday": _fetch_workday,
     "greenhouse": _fetch_greenhouse,
     "lever": _fetch_lever,
+    "ashby": _fetch_ashby,
+    "smartrecruiters": _fetch_smartrecruiters,
 }
 
 
