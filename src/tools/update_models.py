@@ -11,6 +11,14 @@ MODELS.md 生成器：从 New API 网关定价接口拉取可用模型，生成�
 用法：
     python -m src.tools.update_models           # 强制重新生成
     在主流程中调用 maybe_update_monthly() 实现"每月首次运行自动更新"。
+
+注意（2026-08 起）：网关的 /api/pricing 已收紧鉴权，只认后台登录的 access token，
+    sk- 开头的 API Key 无权访问（返回 401）。因此自动刷新无法工作，会被静默跳过。
+    需要刷新时，用浏览器登录控制台 → F12 → Network → pricing 请求 → 复制
+    Authorization 里的 Bearer 令牌（约 15 分钟有效），然后：
+        curl -H "Authorization: Bearer <token>" \\
+             https://newapi.gisphere.info/api/pricing > pricing.json
+    再用 generate_markdown(json.load(pricing.json)["data"]) 写入 MODELS.md。
 """
 import logging
 import re
@@ -223,6 +231,18 @@ def write_models_md(api_key: str, path: Path = MODELS_MD_PATH) -> bool:
         path.write_text(content, encoding="utf-8")
         logger.info(f"✅ MODELS.md 已更新: {path}")
         return True
+    except requests.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 403):
+            # 网关已收紧：/api/pricing 只认后台登录的 access token，sk- API Key 无权访问。
+            # 这属于预期内的"无法自动刷新"，不作为错误告警，仅提示改用手动方式。
+            logger.info(
+                "MODELS.md 自动刷新已跳过：定价接口需后台 access token（API Key 无权访问）。"
+                "如需刷新，请登录控制台取 access token 后手动生成（详见 update_models.py 顶部说明）。"
+            )
+        else:
+            logger.warning(f"生成 MODELS.md 失败: {e}")
+        return False
     except Exception as e:
         logger.warning(f"生成 MODELS.md 失败: {e}")
         return False
