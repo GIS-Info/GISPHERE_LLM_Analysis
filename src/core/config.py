@@ -106,19 +106,24 @@ GEMINI_BASE_URL = "https://newapi.gisphere.info/v1beta"
 
 # === LLM 模型路由链（按效果/偏好排序，运行时逐个回退；统一走 /chat/completions）===
 # 纯文本三阶段分析使用。任一模型不可用（401/403/404/限流）时自动尝试下一个。
-# 顺序依据 2026-06-28 线上抽样实测：claude-sonnet-4-6 最快最稳，gpt-5.5 可用但更慢。
-# 注意：gemini-3.5-flash 当前因上游 Google key 被停用（"Consumer ... has been suspended"）
-#       会返回 403，作为最后兜底保留，待上游恢复后自动重新生效。
+# 2026-08-20 调整：网关下架了整个 gemini 系列（旧的 gemini-3.5-flash 已不存在），
+#   改用新上线的 gpt-5.6 三兄弟（sol 旗舰 $5/$30、terra 中端 $2/$12、luna 轻量 $0.2/$1.2）。
+#   经 3 篇真实招聘页×三阶段实测（llm_logs/model_benchmark_566_*）：三者均 9/9 通过，
+#   实测 terra 性价比最高、sol 旗舰准确度最高。按用户偏好文本链也按能力最强→最弱
+#   （sol→terra→luna），luna 最慢且出现联系人/类型抽取瑕疵故垫底；其后回退 deepseek-v4-pro、model-router。
 TEXT_MODEL_CHAIN = [
-    "claude-opus-4-5",
-    "gpt-5.5",
-    "gemini-3.5-flash",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "deepseek-v4-pro",
+    "model-router",
 ]
-# 图片/文档（VLM）使用：仅含支持视觉输入的模型，同序。
+# 图片/文档（VLM）使用：仅含支持视觉输入的模型，按能力最强→最弱排序。
+# deepseek-v4-pro / model-router 非多模态，故视觉链只保留 gpt-5.6 系列。
 VISION_MODEL_CHAIN = [
-    "claude-opus-4-5",
-    "gpt-5.5",
-    "gemini-3.5-flash",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
 ]
 
 # 向后兼容的单值别名（旧模块/日志仍引用）
