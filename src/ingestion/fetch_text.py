@@ -22,6 +22,7 @@ from ..core.utils import (is_pdf_url, sanitize_filename, normalize_text,
 from . import text_quality
 from . import pdf_extractor
 from . import google_sources
+from . import ats_api
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class ContentFetcher:
     def _reset_last_fetch_summary(self, url: str):
         """重置最近一次抓取摘要。"""
         self._last_http_challenge = False  # HTTP 层是否检测到反爬验证（Cloudflare 等）
+        self._last_http_html = ""          # HTTP 层原始 HTML，供已知 ATS 识别
         self.last_fetch_summary = {
             "url": url,
             "content_type": None,
@@ -173,6 +175,19 @@ class ContentFetcher:
                 )
                 return content
             
+            # 已知 ATS 直连 JSON（Workday/Greenhouse/Lever）：正文来自公开接口，
+            # 免渲染、免反爬。命中且取到实质正文则直接返回，否则回退通用流程。
+            ats_text = ats_api.fetch_ats_content(url)
+            if ats_text:
+                self._finalize_fetch_summary(
+                    "ats_api",
+                    "success",
+                    "special",
+                    len(ats_text),
+                    f"已知 ATS 直连 JSON: {ats_api.detect_ats_kind(url)}"
+                )
+                return ats_text
+
             # 首先尝试基于URL判断
             if is_pdf_url(url):
                 logger.info("根据URL判断为PDF文件，使用PDF处理流程")
@@ -233,6 +248,14 @@ class ContentFetcher:
         """
         strategy = ["http"]
 
+        # curl_cffi：伪造浏览器 TLS/JA3 指纹，能绕过一批"只查 TLS 指纹"的反爬/CDN，
+        # 比开浏览器快几十倍。作为 HTTP 之后、Playwright 之前的一级轻量升级。
+        try:
+            import curl_cffi  # noqa: F401
+            strategy.append("curl_cffi")
+        except Exception:
+            pass
+
         if self.playwright_manager:
             strategy.append("playwright")
 
@@ -271,6 +294,22 @@ class ContentFetcher:
                     logger.warning("⚠️  HTTP 层检测到反爬验证页，跳过 Playwright/截图 OCR，直接使用 browser-use 代理兜底")
                     skip_methods.update({"playwright", "ocr"})
                     continue
+
+            # 已知第三方 ATS 识别：HTTP 只拿到外壳（未达 good）时，判断正文是否由某个
+            # ATS 前端 JS 客户端渲染。对常挂在 Cloudflare 后、headless 难以通过的硬站
+            # （TalentLink/Taleo 等），跳过注定失败的 Playwright/OCR，直接走 browser-use。
+            if method == "http" and attempt.quality != "good":
+                ats = text_quality.detect_ats(url, self._last_http_html)
+                if ats:
+                    self.last_fetch_summary["detected_ats"] = ats
+                    logger.warning(f"⚠️  识别到第三方 ATS 招聘系统: {ats}（正文多为 JS 客户端渲染）")
+                    if ats in text_quality._HEADLESS_HARD_ATS and "browser_agent" in strategy:
+                        logger.warning(
+                            f"⚠️  {ats} 常在 Cloudflare 后、headless 难通过，且正文为 JS 渲染，"
+                            f"跳过 curl_cffi/Playwright/截图 OCR，直接使用 browser-use 代理兜底"
+                        )
+                        skip_methods.update({"curl_cffi", "playwright", "ocr"})
+                        continue
 
             if "pdf_like_content" in attempt.flags:
                 logger.warning("⚠️  检测到网页内容疑似PDF乱码，切换到PDF处理流程")
@@ -333,6 +372,8 @@ class ContentFetcher:
         """执行单次网页抓取尝试并产出统一结果。"""
         if method == "http":
             content = self._fetch_web_content(url)
+        elif method == "curl_cffi":
+            content = self._fetch_web_content_curl_cffi(url)
         elif method == "playwright":
             content = self._fetch_web_content_with_playwright(url)
         elif method == "ocr":
@@ -603,15 +644,17 @@ class ContentFetcher:
     def _fetch_web_content(self, url: str) -> Optional[str]:
         """获取网页文本内容（HTTP 路）：原始 HTML 走智能抽取，失败回退基础提取。"""
         logger.info(f"开始获取网页内容: {url}")
-        
+        self._last_http_html = ""  # 每次抓取前清空，避免沿用上个 URL 的 HTML 做 ATS 识别
+
         try:
             response = self._download_with_retry(url, REQUEST_TIMEOUT)
             if not response:
                 return None
-            
+
             # 检测编码
             response.encoding = response.apparent_encoding or 'utf-8'
             html = response.text
+            self._last_http_html = html  # 供上层做已知 ATS 识别（正文多为 JS 客户端渲染）
             
             # 优先：多候选打分择优抽取（json-ld / trafilatura / og / soup）
             text = self._extract_main_text_safe(html, None)
@@ -631,6 +674,31 @@ class ContentFetcher:
             logger.error(f"网页内容获取失败: {e}")
             return None
     
+    def _fetch_web_content_curl_cffi(self, url: str) -> Optional[str]:
+        """用 curl_cffi 伪造浏览器 TLS/JA3 指纹抓取（可绕过部分 TLS 指纹型反爬/Cloudflare）。"""
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            return None
+        try:
+            logger.info(f"使用 curl_cffi（浏览器 TLS 指纹）获取网页内容: {url}")
+            resp = cffi_requests.get(
+                url, impersonate="chrome", timeout=REQUEST_TIMEOUT, allow_redirects=True
+            )
+            resp.raise_for_status()
+            html = resp.text
+            if html:
+                self._last_http_html = html  # 更新原始 HTML，供 ATS 识别
+            text = self._extract_main_text_safe(html, None) or self._legacy_soup_text(html)
+            if text:
+                logger.info(f"✅ curl_cffi 获取内容成功，长度: {len(text)} 字符")
+                return text
+            logger.warning("curl_cffi 未提取到文本内容")
+            return None
+        except Exception as e:
+            logger.warning(f"curl_cffi 获取失败: {e}")
+            return None
+
     def _fetch_web_content_with_playwright(self, url: str) -> Optional[str]:
         """使用Playwright获取网页内容（通过独立进程）。"""
         if not self.playwright_manager:
