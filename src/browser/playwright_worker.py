@@ -160,7 +160,34 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
                 page.goto(url, wait_until='domcontentloaded', timeout=30000)
             except Exception as e:
                 logger.warning(f"初始页面加载超时（尝试继续）: {e}")
-            
+
+            # 提前探测反爬验证页：若一开始就是 Cloudflare/验证页，headless 基本过不了，
+            # 不必再耗费 initial_wait + networkidle 的长等待。短等一轮仍未通过就快速返回，
+            # 交由上层据 challenge_page 标记直接升级到 browser-use 代理，省下 30-60 秒空等。
+            if not screenshot_mode:
+                try:
+                    early_text = html_to_text(page.content())
+                except Exception:
+                    early_text = ""
+                if is_challenge_page_text(early_text):
+                    logger.warning("⚠️  初始即命中反爬验证页，快速验证等待（跳过智能加载长等待）")
+                    resolved = wait_for_challenge_resolution(page)
+                    if is_challenge_page_text(resolved):
+                        logger.warning("❌ 验证页未自动通过，快速返回，交由上层升级 browser-use 代理")
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        return {
+                            'success': True,
+                            'content': resolved,
+                            'html': None,
+                            'inner_text': resolved,
+                            'error': None,
+                            'length': len(resolved),
+                        }
+                    # 已自动通过验证，继续正常加载流程
+
             # 如果是截图模式，跳过智能加载，使用简单等待
             if screenshot_mode:
                 logger.info("进入截图模式（跳过智能加载，使用充分的固定等待）...")
@@ -209,13 +236,13 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
                             for warning in load_result['warnings']:
                                 logger.warning(f"加载警告: {warning}")
                     else:
-                        # 使用传统方式等待
+                        # 使用传统方式等待（networkidle 上限压到 10s，避免 SPA 长轮询拖满）
                         logger.info("使用传统页面加载等待...")
-                        page.wait_for_load_state('networkidle', timeout=30000)
+                        page.wait_for_load_state('networkidle', timeout=10000)
                         page.wait_for_timeout(3000)
                 except ImportError as e:
                     logger.warning(f"无法导入智能加载器（使用传统方式）: {e}")
-                    page.wait_for_load_state('networkidle', timeout=30000)
+                    page.wait_for_load_state('networkidle', timeout=10000)
                     page.wait_for_timeout(3000)
                 except Exception as e:
                     logger.warning(f"智能加载检测失败（继续处理）: {e}")

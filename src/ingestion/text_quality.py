@@ -177,7 +177,18 @@ def evaluate_web_content_quality(content: Optional[str]) -> Tuple[int, str, List
 
     score = max(0, min(100, score))
 
-    if score >= 60:
+    # 实质内容门槛：短页面若没有任何职位细节段落（detail_hits==0），很可能只是
+    # 导航/壳页——正文由 JS 客户端渲染（如 TalentLink/Workday 等 ATS 组件），HTTP
+    # 只拿到外壳。这类页面即便因通用导航词（Research、Application Process 等）得分虚高，
+    # 也不应判为 "good" 而提前终止抓取，应压到 "weak" 以触发 Playwright / browser-use 升级。
+    has_substance = content_length >= 500 or detail_hits >= 1
+    if not has_substance:
+        flags.append("insufficient_substance")
+
+    if not has_substance and score >= 35:
+        quality = "weak"
+        reason = "内容偏短且缺少职位正文特征，疑似壳页，需升级抓取"
+    elif score >= 60:
         quality = "good"
         reason = "正文特征充足"
     elif score >= 35:
@@ -188,6 +199,37 @@ def evaluate_web_content_quality(content: Optional[str]) -> Tuple[int, str, List
         reason = "内容疑似模板页、壳页或无效文本"
 
     return score, quality, flags, reason
+
+
+# ──────────────────────────────────────────────────────────────────
+# 已知 ATS（第三方招聘系统）识别
+# ──────────────────────────────────────────────────────────────────
+# 这些平台的职位正文多由前端 JS 客户端渲染，纯 HTTP 只能拿到外壳/导航。
+# 按 URL 域名 + 页面 HTML 特征识别，供抓取管线据此调整升级策略。
+_ATS_SIGNATURES = {
+    "workday": ("myworkdayjobs.com", ".myworkday", "/wday/"),
+    "greenhouse": ("boards.greenhouse.io", "greenhouse.io/embed", "grnhse", "boards-api.greenhouse"),
+    "lever": ("jobs.lever.co", "lever.co/postings", "api.lever.co"),
+    "ashby": ("jobs.ashbyhq.com", "ashbyhq"),
+    "smartrecruiters": ("smartrecruiters.com",),
+    "icims": ("icims.com",),
+    "taleo": ("taleo.net",),
+    "successfactors": ("successfactors.com", "sfcareer", "jobs.sap.com"),
+    "talentlink": ("lumessetalentlink.com", "data-talentlink-fo-", "talentlink"),
+    "oraclecloud": ("oraclecloud.com/hcmui", "/hcmui/candidateexperience"),
+}
+# 这些 ATS 常挂在 Cloudflare 等反爬后，headless 浏览器基本过不了，
+# 直接走 browser-use 代理比先白跑一遍 Playwright/OCR 更省时。
+_HEADLESS_HARD_ATS = {"talentlink", "taleo", "successfactors", "oraclecloud"}
+
+
+def detect_ats(url: Optional[str], html: Optional[str] = None) -> Optional[str]:
+    """识别 URL/HTML 属于哪个已知第三方 ATS，未命中返回 None。"""
+    haystack = f"{url or ''} {html or ''}".lower()
+    for name, signatures in _ATS_SIGNATURES.items():
+        if any(sig in haystack for sig in signatures):
+            return name
+    return None
 
 
 def is_likely_pdf_content(content: str) -> bool:

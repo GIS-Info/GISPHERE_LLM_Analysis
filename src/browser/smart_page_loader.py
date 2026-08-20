@@ -84,7 +84,9 @@ class SmartPageLoader:
                 logger.info("策略1: 等待网络空闲...")
                 remaining_timeout = self.max_wait_time - (time.time() - start_time)
                 if remaining_timeout > 0:
-                    page.wait_for_load_state('networkidle', timeout=min(30000, int(remaining_timeout * 1000)))
+                    # networkidle 上限压到 10s：SPA 的长轮询/心跳会让网络永不空闲，
+                    # 与其干等 30s，不如尽快交给下面的内容稳定性/关键元素检测（真正的主力）。
+                    page.wait_for_load_state('networkidle', timeout=min(10000, int(remaining_timeout * 1000)))
                     logger.info("✓ 网络空闲状态达到")
                     result['strategy'] = 'networkidle'
                 else:
