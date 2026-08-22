@@ -83,7 +83,30 @@ def wait_for_challenge_resolution(page) -> str:
 
     return last_text
 
-def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: bool = False) -> dict:
+
+def _apply_explicit_wait(page, wait_selector, wait_timeout_ms) -> bool:
+    """借鉴 Crawl4AI 的 wait_for：显式等待某条件满足后再继续，替代固定盲等。
+
+    wait_selector 为 CSS 选择器；以 "js:" 开头则其余部分作为 JS 表达式走
+    wait_for_function。返回 True=条件满足；None/超时/异常返回 False（调用方继续常规加载）。
+    """
+    if not wait_selector:
+        return False
+    _wait_ms = wait_timeout_ms or 15000
+    try:
+        if wait_selector.startswith("js:"):
+            page.wait_for_function(wait_selector[3:], timeout=_wait_ms)
+        else:
+            page.wait_for_selector(wait_selector, timeout=_wait_ms)
+        logger.info(f"显式等待条件已满足: {wait_selector}")
+        return True
+    except Exception as e:
+        logger.warning(f"显式等待条件超时（继续常规加载）: {wait_selector} - {e}")
+        return False
+
+
+def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: bool = False,
+                        wait_selector: str = None, wait_timeout_ms: int = None) -> dict:
     """
     在独立进程中运行Playwright任务
     
@@ -210,6 +233,10 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
                             'length': len(resolved),
                         }
                     # 已自动通过验证，继续正常加载流程
+
+            # 显式等待条件（借鉴 Crawl4AI 的 wait_for）：命中即返回，替代盲等。
+            # 默认 wait_selector=None => 跳过，完全保持原有智能加载/盲等逻辑。
+            _apply_explicit_wait(page, wait_selector, wait_timeout_ms)
 
             # 如果是截图模式，跳过智能加载，使用简单等待
             if screenshot_mode:
@@ -732,7 +759,11 @@ if __name__ == "__main__":
         url = sys.argv[1]
         scroll_enabled = sys.argv[2].lower() == 'true' if len(sys.argv) > 2 else True
         screenshot_mode = sys.argv[3].lower() == 'true' if len(sys.argv) > 3 else False
-        result = run_playwright_task(url, scroll_enabled, screenshot_mode)
+        # 可选：sys.argv[4]=显式等待条件(CSS 或 js: 前缀)，sys.argv[5]=等待超时(ms)
+        wait_selector = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        wait_timeout_ms = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else None
+        result = run_playwright_task(url, scroll_enabled, screenshot_mode,
+                                     wait_selector, wait_timeout_ms)
     
     # 输出JSON结果
     print(json.dumps(result, ensure_ascii=False))

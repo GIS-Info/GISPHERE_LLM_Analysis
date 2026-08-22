@@ -33,11 +33,11 @@ def check_dependencies():
         'google-auth-httplib2': 'google_auth_httplib2',
         'google-auth': 'google.auth',
         'google-auth-oauthlib': 'google_auth_oauthlib',
-        'inflect': 'inflect',
         'tqdm': 'tqdm',
         'urllib3': 'urllib3',
         'lxml': 'lxml',
         'trafilatura': 'trafilatura',
+        'resiliparse': 'resiliparse',
         'lxml_html_clean': 'lxml_html_clean',
     }
     

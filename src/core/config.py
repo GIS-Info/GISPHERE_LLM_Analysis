@@ -82,12 +82,24 @@ SCREENSHOT_CLEANUP_AFTER_USE = True  # 使用后是否自动清理截图
 # 多步交互（过验证页、关弹窗、展开内容）后提取正文。成本较高（单 URL 约
 # 1.6万–6.3万 token），因此只做兜底。设环境变量 USE_BROWSER_AGENT=0 可关闭。
 USE_BROWSER_AGENT = os.getenv("USE_BROWSER_AGENT", "1").lower() in ("1", "true", "yes", "on")
-BROWSER_AGENT_MODEL = "gpt-5.5"   # 2026-07-08 实测：网关上该模型对 browser-use 的工具调用最稳
+BROWSER_AGENT_MODEL = "gpt-5.6-sol"   # 2026-08-22 切到 gpt-5.6 旗舰 sol（与主链对齐）；旧值 gpt-5.5 若工具调用更稳可回退
 BROWSER_AGENT_MAX_STEPS = 12      # 单任务最大代理步数（成本上限）
 BROWSER_AGENT_TIMEOUT = 300       # 单 URL 兜底总超时（秒）
 # 网关 nginx 对含整页截图的大请求体返回 413，故禁用视觉、仅用 DOM 文本；
 # 若网关调大 client_max_body_size 后可改为 True
 BROWSER_AGENT_USE_VISION = False
+
+# browser-use 调优（P0：最贵一层，目标 token 直降过半）：
+# - page_extraction_llm 指向最便宜的 luna（$0.2/$1.2）：extract 动作要处理整页大文本，
+#   用轻量模型直降成本，主 agent 仍用 gpt-5.5 保证工具调用/导航决策稳定。
+# - flash_mode + 关闭 thinking：跳过每步的推理段落，压缩 prompt。
+# - max_history_items：只带最近 N 步历史进上下文，避免多步任务里历史线性膨胀。
+#   注意：browser-use 0.13.3 硬约束该值必须为 None 或 > 5，故最小取 6。
+# - directly_open_url：首步直接打开任务里的 URL，省掉一次导航往返。
+BROWSER_AGENT_EXTRACTION_MODEL = "gpt-5.6-luna"
+BROWSER_AGENT_FLASH_MODE = os.getenv("BROWSER_AGENT_FLASH_MODE", "1").lower() in ("1", "true", "yes", "on")
+BROWSER_AGENT_MAX_HISTORY_ITEMS = int(os.getenv("BROWSER_AGENT_MAX_HISTORY_ITEMS", "6"))
+BROWSER_AGENT_DIRECTLY_OPEN_URL = os.getenv("BROWSER_AGENT_DIRECTLY_OPEN_URL", "1").lower() in ("1", "true", "yes", "on")
 
 # PDF 查看器（腾讯文档等）逐页截图配置
 # 按页码逐页裁剪，确保每张截图恰好是完整一页（不会上一页一半下一页一半）

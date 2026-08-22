@@ -6,7 +6,6 @@ import pickle
 import pandas as pd
 import logging
 import warnings
-import inflect
 from typing import List, Dict, Optional, Tuple
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -25,9 +24,6 @@ pd.set_option('display.max_columns', None)
 
 # 禁止显示警告
 warnings.filterwarnings('ignore')
-
-# 初始化用于数字到单词转换的变形引擎
-p = inflect.engine()
 
 logger = logging.getLogger(__name__)
 

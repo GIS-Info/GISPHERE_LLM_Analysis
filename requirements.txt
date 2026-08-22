@@ -31,6 +31,7 @@ openpyxl>=3.1.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 trafilatura>=1.8.0
+resiliparse>=1.0.0
 lxml_html_clean>=0.1.0
 
 # Progress
@@ -63,9 +64,6 @@ google-api-python-client>=2.117.0
 google-auth-httplib2>=0.1.0
 google-auth-oauthlib>=1.0.0
 google-auth>=2.17.0
-
-# Text processing (Sheets label inflection, etc.)
-inflect>=6.0.0
 
 # -----------------------------------------------------------------------------
 # Optional - OCR image preprocessing; skipped automatically if not installed

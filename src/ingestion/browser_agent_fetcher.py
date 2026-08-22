@@ -17,6 +17,10 @@ from typing import Optional
 
 from ..core.config import (
     API_BASE_URL,
+    BROWSER_AGENT_DIRECTLY_OPEN_URL,
+    BROWSER_AGENT_EXTRACTION_MODEL,
+    BROWSER_AGENT_FLASH_MODE,
+    BROWSER_AGENT_MAX_HISTORY_ITEMS,
     BROWSER_AGENT_MAX_STEPS,
     BROWSER_AGENT_MODEL,
     BROWSER_AGENT_TIMEOUT,
@@ -106,6 +110,17 @@ async def _run_agent(url: str, api_key: str) -> Optional[str]:
         add_schema_to_system_prompt=True,
         timeout=120,
     )
+    # 页面正文抽取（extract 动作）用最便宜的轻量模型：这一步输入是整页大文本，
+    # 但只做“照抄/摘录”，不需要旗舰模型；主 agent 仍用上面的模型做导航决策。
+    extraction_llm = ChatOpenAI(
+        model=BROWSER_AGENT_EXTRACTION_MODEL,
+        api_key=api_key,
+        base_url=API_BASE_URL,
+        temperature=0.0,
+        dont_force_structured_output=True,
+        add_schema_to_system_prompt=True,
+        timeout=120,
+    )
     browser_exe = _find_browser_executable()
     logger.info(f"browser-use 使用浏览器: {browser_exe or '(由 browser-use 自行下载)'}")
     profile = BrowserProfile(
@@ -119,6 +134,12 @@ async def _run_agent(url: str, api_key: str) -> Optional[str]:
         llm=llm,
         browser_session=session,
         use_vision=BROWSER_AGENT_USE_VISION,
+        # ↓ P0 调优：压 token / 减步数（详见 config.py 注释）
+        page_extraction_llm=extraction_llm,
+        flash_mode=BROWSER_AGENT_FLASH_MODE,
+        use_thinking=False,
+        max_history_items=BROWSER_AGENT_MAX_HISTORY_ITEMS,
+        directly_open_url=BROWSER_AGENT_DIRECTLY_OPEN_URL,
     )
     try:
         history = await agent.run(max_steps=BROWSER_AGENT_MAX_STEPS)

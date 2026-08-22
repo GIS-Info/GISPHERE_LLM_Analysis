@@ -175,6 +175,21 @@ def _extract_trafilatura(html: str) -> str:
         return ""
 
 
+def _extract_resiliparse(html: str) -> str:
+    """resiliparse 正文抽取（高召回、C 实现极快、无 GPU）：作为 trafilatura 的并列候选，
+    在 trafilatura 抽空/过短时兜底。未安装则优雅降级返回空（不加入候选）。"""
+    try:
+        from resiliparse.extract.html2text import extract_plain_text
+    except Exception:
+        return ""
+    try:
+        out = extract_plain_text(html, main_content=True, alt_texts=False, links=False)
+        return _normalize_ws(out or "")
+    except Exception as e:
+        logger.debug(f"resiliparse 抽取失败: {e}")
+        return ""
+
+
 def _soup_text(html: str) -> str:
     try:
         from bs4 import BeautifulSoup
@@ -245,6 +260,10 @@ def extract_main_text(html: Optional[str], rendered_text: Optional[str] = None) 
         if traf:
             candidates.append(Candidate("trafilatura", traf))
 
+        resi = _extract_resiliparse(html)
+        if resi:
+            candidates.append(Candidate("resiliparse", resi))
+
         og = _extract_meta(html, "og:description") or _extract_meta(html, "description", attr="name")
         if og:
             candidates.append(Candidate("og:description", og))
@@ -265,6 +284,7 @@ def extract_main_text(html: Optional[str], rendered_text: Optional[str] = None) 
     weights = {
         "json-ld": (1.0, 1200.0),
         "trafilatura": (1.0, 300.0),
+        "resiliparse": (1.0, 300.0),
         "og:description": (0.9, -200.0),
         "innerText": (0.40, 0.0),
         "soup": (0.35, 0.0),

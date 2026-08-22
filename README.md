@@ -66,9 +66,10 @@ python -m src.tools.update_models
 
 ### 内容提取能力
 
+- **ATS 直连 JSON/XML**（免渲染、免反爬、毫秒级）: 命中已知招聘系统时直取其公开接口，绕过整条渲染/反爬链（`ats_api`，覆盖 11 家，见「ATS 直连与学术 RSS」）
 - **多种获取方式**: HTTP、Playwright 动态渲染、PDF 解析、VLM 文档提取、Tesseract OCR、browser-use 智能代理
-- **智能页面加载**: 网络空闲、关键元素、内容/高度稳定性等多策略（`smart_page_loader`）
-- **打分式正文抽取**: JSON-LD / trafilatura / og:description / innerText 多路候选择优（`content_extractor`）
+- **智能页面加载**: 网络空闲、关键元素、内容/高度稳定性等多策略（`smart_page_loader`）；支持显式等待条件 `wait_for`（CSS 选择器 / JS 表达式，命中即返回，替代固定盲等）
+- **打分式正文抽取**: JSON-LD / trafilatura / resiliparse / og:description / innerText 多路候选择优（`content_extractor`）
 - **逐页 PDF 截图**: 在线 PDF 预览器按页裁剪，保证每张恰好一页
 - **VLM 文档提取**: `document_ai` 模块通过 `VISION_MODEL_CHAIN` 调用多模态 LLM（**非** Google Cloud Document AI）
 - **多层回退**: 见下方「内容提取回退链」
@@ -114,6 +115,8 @@ src/
   ingestion/
     excel_handler.py     # Excel / Sheets 读写
     fetch_text.py        # 内容获取总编排
+    ats_api.py           # ATS 招聘系统直连 JSON/XML（11 家，回退链第 0 级）
+    academic_rss.py      # 学术岗位 RSS 采集（岗位发现能力）
     content_extractor.py # 打分式 HTML 正文抽取
     text_quality.py      # 文本清洗与质量评估
     pdf_extractor.py     # PDF 多后端提取
@@ -146,8 +149,9 @@ LICENSE
 ```python
 API_BASE_URL = "https://newapi.gisphere.info/v1"
 
-TEXT_MODEL_CHAIN = ["gpt-5.4-mini", "gemini-2.5-flash", "claude-opus-4.5"]
-VISION_MODEL_CHAIN = ["gpt-5.4-mini", "gemini-2.5-flash", "claude-opus-4.5"]
+# 价格升序回退：sol 旗舰 → terra 中端 → luna 轻量 → deepseek → 路由
+TEXT_MODEL_CHAIN   = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4-pro", "model-router"]
+VISION_MODEL_CHAIN = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]  # 仅保留多模态模型
 
 MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 ```
@@ -162,13 +166,25 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 | `USE_DOCUMENT_AI` | `True` | 是否优先 VLM 提取 PDF/图片文字 |
 | `USE_SCREENSHOT_OCR` | `True` | 是否在常规提取失败后截图 OCR |
 | `USE_BROWSER_AGENT` | `True` | 是否启用 browser-use 智能代理兜底（可用环境变量 `USE_BROWSER_AGENT=0` 覆盖） |
-| `BROWSER_AGENT_MODEL` | `gpt-5.5` | 代理所用模型（走同一 New API 网关） |
+| `BROWSER_AGENT_MODEL` | `gpt-5.6-sol` | 代理主模型（导航决策，走同一 New API 网关） |
+| `BROWSER_AGENT_EXTRACTION_MODEL` | `gpt-5.6-luna` | 页面正文抽取用的轻量模型（整页大文本走便宜模型，token 直降） |
 | `BROWSER_AGENT_MAX_STEPS` | `12` | 单任务最大代理步数（成本上限） |
+| `BROWSER_AGENT_MAX_HISTORY_ITEMS` | `6` | 带入上下文的最近步数（越小越省 token；库约束须 >5） |
+| `BROWSER_AGENT_FLASH_MODE` | `True` | 跳过每步推理段落、压缩 prompt（降 token） |
 | `BROWSER_AGENT_USE_VISION` | `False` | 是否给代理发截图；网关 nginx 对大请求体返回 413，默认纯 DOM 文本 |
 | `CONTACT_VERIFICATION_ENABLED` | `True` | 是否执行联系人验证流程 |
 | `OCR_LANGUAGE` | `eng+chi_sim` | Tesseract 语言；需安装对应语言包 |
 
 ## 🔄 处理流程
+
+```mermaid
+flowchart LR
+    A["Sheets / Excel"] --> B["提取 URL<br/>(Source 优先, 回退 Notes)"]
+    B --> C["内容获取回退链"]
+    C --> D["三阶段 LLM 分析<br/>(可部分成功)"]
+    D --> E["联系人 / 方向验证<br/>(HTTP + MCP)"]
+    E --> F["写回结果 + Verifier/Error<br/>保存 llm_logs/"]
+```
 
 1. 加载 Google Sheets 或本地 Excel。
 2. 从 `Source`（优先）或 `Notes` 提取 URL。
@@ -179,10 +195,29 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 
 ### 内容提取回退链
 
+```mermaid
+flowchart TD
+    U["目标 URL"] --> Q{"命中已知 ATS?"}
+    Q -->|是| ATS["ATS 直连 JSON/XML<br/>毫秒级 · 免反爬"]
+    Q -->|否| H["HTTP + 打分抽取<br/>json-ld / trafilatura / resiliparse"]
+    ATS -->|失败| H
+    H -->|正文不足| P["Playwright 渲染<br/>+ wait_for 显式等待"]
+    P -->|正文不足| S["截图 → VLM → OCR"]
+    H -->|命中验证页| BU["browser-use 智能代理兜底<br/>过验证 / 关弹窗 · 高成本"]
+    P -->|命中验证页| BU
+    S -->|仍失败| BU
+    ATS -->|成功| OK["结构化正文"]
+    H -->|成功| OK
+    P -->|成功| OK
+    S -->|成功| OK
+    BU --> OK
+```
+
 **普通网页**
 
-1. HTTP + 打分式正文抽取（`content_extractor`）
-2. Playwright 动态渲染 + 再抽取
+0. **ATS 直连 JSON/XML**（`ats_api`）：命中已知招聘系统时直取公开接口，秒回结构化正文，免渲染免反爬；未命中或失败自动回退下一级
+1. HTTP + 打分式正文抽取（`content_extractor`：JSON-LD / trafilatura / resiliparse / og / innerText 择优）
+2. Playwright 动态渲染 + 再抽取（可用 `wait_for` 显式等待关键元素）
 3. 长页/难页截图 → VLM（`document_ai`）→ Tesseract OCR
 4. **browser-use 智能代理兜底**（`browser_agent_fetcher`）：LLM 驱动浏览器多步交互（等验证页、关弹窗、展开内容）后提取正文；仅在前面全部失败后触发（Playwright 检测到验证页时跳过第 3 级直达本级）。单 URL 约 1.6万–6.3万 token，成本原因只做兜底
 
@@ -199,6 +234,36 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 **Google Drive / Google Docs**
 
 - 专用导出或 Playwright 路径（`google_sources.py`）
+
+## 🔌 ATS 直连与学术 RSS
+
+### ATS 招聘系统直连（`ats_api`）
+
+许多招聘页由前端 JS 渲染、且常被 Cloudflare 拦截，但其数据其实来自**公开的 JSON/XML 接口**。命中已知 ATS 时按 URL 直接命中接口，**免渲染、免反爬、毫秒级**返回结构化正文；未命中或失败自动回退通用抓取链（`fetch_ats_content` 内 `try/except` + 正文 ≥200 字符校验，保证坏解析只会安全回退、不破坏流程）。
+
+| 平台 | 接口形式 |
+|------|----------|
+| Workday | `{tenant}.wdN.myworkdayjobs.com/wday/cxs/{tenant}/{site}/job/...` |
+| Greenhouse | `boards-api.greenhouse.io/v1/boards/{token}/jobs/{id}` |
+| Lever | `api.lever.co/v0/postings/{company}/{id}` |
+| Ashby | `api.ashbyhq.com/posting-api/job-board/{org}` |
+| SmartRecruiters | `api.smartrecruiters.com/v1/companies/{c}/postings/{id}` |
+| Recruitee | `{company}.recruitee.com/api/offers/` |
+| Workable | `apply.workable.com/api/v1/widget/accounts/{slug}` |
+| Personio | `{company}.jobs.personio.de/xml`（XML） |
+| Teamtailor | `{tenant}.teamtailor.com/jobs.json`（JSON Feed） |
+| BambooHR | `{company}.bamboohr.com/careers/{id}/detail` |
+| Eightfold | `{company}.eightfold.ai/api/apply/v2/jobs` |
+| Oracle HCM | `{host}/hcmRestApi/.../recruitingCEJobRequisitionDetails` |
+
+> **Taleo** 因需 CSRF/session、非免鉴权 GET，未纳入直连，保留走通用抓取链。
+> Eightfold 需公司主域 `domain` 参数、Oracle 需可匿名访问的实例，个别站点命中率取决于其配置，失败均自动回退。
+
+### 学术岗位 RSS 采集（`academic_rss`）
+
+`fetch_academic_rss_jobs(sources, query, limit)` 拉取学术招聘站的公开 RSS，解析为结构化职位列表（`title` / `url` / `description` / `published` / `source`）。当前支持 **THE unijobs**、**HigherEdJobs**（jobs.ac.uk 旧 RSS 已下线）。
+
+> 这是**岗位发现能力**，独立于「URL→正文」抓取链；发现的岗位如何进入主流程（去重、写回 Sheets、触发抓取与分析）需按业务另行接线，**默认不自动接入主流程**。
 
 ## 📋 数据表列说明
 
@@ -326,6 +391,17 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 **排错顺序**：`llm_logs/row_*.txt` → `logs/run.log` → `python -m src.tools.check_system`
 
 ## 🗓️ 更新日志
+
+### v3.3 - 2026-08
+
+- ✅ **ATS 直连扩展至 11 家**（回退链新增第 0 级）：新增 Recruitee / Workable / Personio / BambooHR / Teamtailor / Eightfold / Oracle HCM 直连 JSON/XML，命中即秒回结构化正文、免反爬；Personio / Recruitee / Workable / Teamtailor 已真实端到端验证。Taleo 评估后不纳入（需 CSRF）
+- ✅ **学术岗位 RSS 采集**（`academic_rss`）：THE unijobs / HigherEdJobs，返回结构化职位列表（岗位发现能力）
+- ✅ **正文抽取新增 resiliparse 候选**：与 trafilatura 并列打分择优，抽空/过短时兜底（recall 0.955、C 实现极快、无 GPU）
+- ✅ **Playwright `wait_for` 显式等待**：CSS 选择器 / JS 表达式命中即返回，替代固定盲等（`_apply_explicit_wait`；默认不启用，向后兼容）
+- ✅ **browser-use 调优**（token 直降）：`flash_mode` + 关闭 thinking + `page_extraction_llm` 指向轻量 luna 处理整页大文本 + 限制历史条数 + 直接打开 URL
+- ✅ 模型链切换到 **gpt-5.6** 系列（sol 旗舰 / terra 中端 / luna 轻量，价格升序回退）
+- 🐛 修复：ATS `_get_text` 的 UTF-8 mojibake、Teamtailor JSON Feed 结构解析、Oracle 字母数字 requisition id
+- 🧹 清理僵尸依赖 `inflect`
 
 ### v3.2 - 2026-07
 
