@@ -1,12 +1,13 @@
 """
 PDF 文本提取后端（纯函数集合）。
 
-从 fetch_text.py 抽出的五路提取实现，均接收 pdf_path、返回文本或 None：
-- extract_with_document_ai：多模态 LLM（优先）
-- extract_with_pymupdf：PyMuPDF
-- extract_with_pdfplumber：pdfplumber
-- extract_with_pypdf2：PyPDF2
-- extract_with_ocr：Tesseract OCR（兜底）
+从 fetch_text.py 抽出的多路提取实现，均接收 pdf_path、返回文本或 None。
+分档理念：**免费/本地优先，付费 VLM 仅作扫描件兜底**（见 _extract_pdf_text 编排）：
+- extract_with_pymupdf4llm：PyMuPDF4LLM 直出 Markdown（保留标题/列表/表格结构，首选）
+- extract_with_pymupdf：PyMuPDF 裸文本（无结构，pymupdf4llm 不可用时的同源回退）
+- extract_with_pdfplumber：pdfplumber（表格友好）
+- extract_with_ocr：Tesseract OCR（免费本地，扫描件）
+- extract_with_document_ai：多模态 LLM（付费，最后兜底——仅扫描件且 OCR 也失败时）
 
 注：提取的"编排+校验"仍保留在 ContentFetcher._extract_pdf_text（以兼容测试中对实例方法的覆写）。
 """
@@ -41,6 +42,31 @@ def extract_with_document_ai(pdf_path: Path) -> Optional[str]:
     except Exception as e:
         logger.error(f"Document AI 提取失败: {e}")
         return None
+
+
+def extract_with_pymupdf4llm(pdf_path: Path) -> Optional[str]:
+    """使用 PyMuPDF4LLM 直出 Markdown（保留标题/列表/表格结构）。
+
+    首选档：与裸 PyMuPDF 同源（都基于 MuPDF，无网络、无付费、CPU 秒级），但输出
+    结构化 Markdown，更利于下游 LLM 理解岗位/学术正文。对无文本层的扫描件会返回
+    空串或极短文本，由上层校验判否后自然降级到 OCR / Document AI。
+    """
+    try:
+        import pymupdf4llm
+
+        # page_chunks=False → 返回整篇 Markdown 字符串；不做激进清洗以保留表格/标题标记
+        md = pymupdf4llm.to_markdown(str(pdf_path))
+        if md and md.strip():
+            # 仅折叠 3+ 连续空行，保留 Markdown 结构
+            import re as _re
+            md = _re.sub(r"\n\s*\n\s*\n+", "\n\n", md).strip()
+            return md or None
+    except ImportError:
+        logger.debug("pymupdf4llm 未安装，跳过此方法")
+    except Exception as e:
+        logger.debug(f"pymupdf4llm 提取失败: {e}")
+
+    return None
 
 
 def extract_with_pymupdf(pdf_path: Path) -> Optional[str]:
@@ -124,38 +150,6 @@ def extract_with_pdfplumber(pdf_path: Path) -> Optional[str]:
         logger.debug("pdfplumber未安装，跳过此方法")
     except Exception as e:
         logger.debug(f"pdfplumber提取失败: {e}")
-
-    return None
-
-
-def extract_with_pypdf2(pdf_path: Path) -> Optional[str]:
-    """使用PyPDF2提取文本"""
-    try:
-        import PyPDF2
-
-        text_content = []
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-
-            for page_num in range(len(reader.pages)):
-                try:
-                    page = reader.pages[page_num]
-                    text = page.extract_text()
-
-                    if text and text.strip():
-                        text_content.append(text)
-                except Exception as e:
-                    logger.debug(f"PyPDF2页面提取失败: {e}")
-                    continue
-
-        if text_content:
-            full_text = '\n'.join(text_content)
-            return text_quality.clean_and_normalize_text(full_text)
-
-    except ImportError:
-        logger.debug("PyPDF2未安装，跳过此方法")
-    except Exception as e:
-        logger.debug(f"PyPDF2提取失败: {e}")
 
     return None
 

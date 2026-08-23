@@ -481,75 +481,47 @@ class ContentFetcher:
             return None
     
     def _extract_pdf_text(self, pdf_path: Path) -> Optional[str]:
-        """从PDF文件提取文本，使用多种方法和候补策略"""
+        """从PDF文件提取文本，按「免费/本地优先、付费 VLM 兜底」分档。
+
+        绝大多数岗位/学术 PDF 都带原生文本层，PyMuPDF4LLM 秒级免费即可直出结构化
+        Markdown；只有无文本层的扫描件才逐级降到 OCR，再不行才动用付费多模态 LLM。
+        每档产出都过 _is_valid_text 校验，未通过则继续降档（校验即为升级阀门）。
+        """
         logger.info(f"开始提取PDF文本: {pdf_path}")
-        
-        # 方法0：使用 Document AI (优先方法) - 多模态LLM直接提取
+
+        # 免费/本地档，按质量优先级排列；命中且校验通过即返回
+        methods = [
+            ("PyMuPDF4LLM(Markdown)", self._extract_with_pymupdf4llm),
+            ("PyMuPDF", self._extract_with_pymupdf),
+            ("pdfplumber", self._extract_with_pdfplumber),
+            ("OCR", self._extract_with_ocr),
+        ]
+        for i, (name, fn) in enumerate(methods, start=1):
+            logger.info(f"尝试方法{i}: {name} 文本提取...")
+            text = fn(pdf_path)
+            if text and len(text) > 0:
+                logger.info(f"{name} 原始提取结果: {len(text)} 字符")
+                if self._is_valid_text(text):
+                    logger.info(f"✅ {name} 提取成功且验证通过")
+                    return text
+                logger.warning(f"❌ {name} 提取的文本未通过验证")
+            else:
+                logger.warning(f"❌ {name} 未能提取到文本")
+
+        # 兜底档：付费多模态 LLM。仅当上面免费/本地档全部失败（典型为扫描件且
+        # OCR 也识别不出）时才动用，避免对普通带文本层的 PDF 无谓烧钱。
         if USE_DOCUMENT_AI:
-            logger.info("尝试方法0: Document AI 文本提取（优先）...")
+            logger.info("免费档全部失败，尝试兜底方法: Document AI (多模态LLM，付费)...")
             text = self._extract_with_document_ai(pdf_path)
             if text and len(text) > 0:
                 logger.info(f"Document AI 原始提取结果: {len(text)} 字符")
                 if self._is_valid_text(text):
                     logger.info("✅ Document AI 提取成功且验证通过")
                     return text
-                else:
-                    logger.warning("❌ Document AI 提取的文本未通过验证，尝试其他方法")
+                logger.warning("❌ Document AI 提取的文本未通过验证")
             else:
-                logger.warning("❌ Document AI 未能提取到文本，尝试其他方法")
-        
-        # 方法1：使用PyMuPDF (fitz) - 主要方法
-        logger.info("尝试方法1: PyMuPDF文本提取...")
-        text = self._extract_with_pymupdf(pdf_path)
-        if text and len(text) > 0:
-            logger.info(f"PyMuPDF原始提取结果: {len(text)} 字符")
-            if self._is_valid_text(text):
-                logger.info("✅ PyMuPDF提取成功且验证通过")
-                return text
-            else:
-                logger.warning("❌ PyMuPDF提取的文本未通过验证")
-        else:
-            logger.warning("❌ PyMuPDF未能提取到文本")
-        
-        # 方法2：使用pdfplumber - 候补方法1
-        logger.info("尝试方法2: pdfplumber文本提取...")
-        text = self._extract_with_pdfplumber(pdf_path)
-        if text and len(text) > 0:
-            logger.info(f"pdfplumber原始提取结果: {len(text)} 字符")
-            if self._is_valid_text(text):
-                logger.info("✅ pdfplumber提取成功且验证通过")
-                return text
-            else:
-                logger.warning("❌ pdfplumber提取的文本未通过验证")
-        else:
-            logger.warning("❌ pdfplumber未能提取到文本")
-        
-        # 方法3：使用PyPDF2 - 候补方法2
-        logger.info("尝试方法3: PyPDF2文本提取...")
-        text = self._extract_with_pypdf2(pdf_path)
-        if text and len(text) > 0:
-            logger.info(f"PyPDF2原始提取结果: {len(text)} 字符")
-            if self._is_valid_text(text):
-                logger.info("✅ PyPDF2提取成功且验证通过")
-                return text
-            else:
-                logger.warning("❌ PyPDF2提取的文本未通过验证")
-        else:
-            logger.warning("❌ PyPDF2未能提取到文本")
-        
-        # 方法4：尝试OCR - 最后的候补方案
-        logger.info("尝试方法4: OCR文本识别...")
-        text = self._extract_with_ocr(pdf_path)
-        if text and len(text) > 0:
-            logger.info(f"OCR原始提取结果: {len(text)} 字符")
-            if self._is_valid_text(text):
-                logger.info("✅ OCR提取成功且验证通过")
-                return text
-            else:
-                logger.warning("❌ OCR提取的文本未通过验证")
-        else:
-            logger.warning("❌ OCR未能提取到文本")
-        
+                logger.warning("❌ Document AI 未能提取到文本")
+
         logger.error("❌ 所有PDF文本提取方法都失败，无法获取有效文本")
         return None
     
@@ -557,18 +529,18 @@ class ContentFetcher:
         """使用 Document AI (多模态LLM) 提取PDF文本（委托 pdf_extractor）。"""
         return pdf_extractor.extract_with_document_ai(pdf_path)
     
+    def _extract_with_pymupdf4llm(self, pdf_path: Path) -> Optional[str]:
+        """PyMuPDF4LLM 直出 Markdown（委托 pdf_extractor）。"""
+        return pdf_extractor.extract_with_pymupdf4llm(pdf_path)
+
     def _extract_with_pymupdf(self, pdf_path: Path) -> Optional[str]:
         """使用PyMuPDF提取文本（委托 pdf_extractor）。"""
         return pdf_extractor.extract_with_pymupdf(pdf_path)
-    
+
     def _extract_with_pdfplumber(self, pdf_path: Path) -> Optional[str]:
         """使用pdfplumber提取文本（委托 pdf_extractor）。"""
         return pdf_extractor.extract_with_pdfplumber(pdf_path)
-    
-    def _extract_with_pypdf2(self, pdf_path: Path) -> Optional[str]:
-        """使用PyPDF2提取文本（委托 pdf_extractor）。"""
-        return pdf_extractor.extract_with_pypdf2(pdf_path)
-    
+
     def _extract_with_ocr(self, pdf_path: Path) -> Optional[str]:
         """使用OCR提取文本（委托 pdf_extractor）。"""
         return pdf_extractor.extract_with_ocr(pdf_path)
@@ -1028,21 +1000,26 @@ def test_pdf_extraction_fallback():
             super().__init__()
             self.method_call_count = 0
             
+        def _extract_with_pymupdf4llm(self, pdf_path):
+            self.method_call_count += 1
+            logger.info("模拟PyMuPDF4LLM 无文本层（返回 None，降档）")
+            return None
+
         def _extract_with_pymupdf(self, pdf_path):
             self.method_call_count += 1
             logger.info("模拟PyMuPDF提取返回乱码")
             return "%PDF-1.7 corrupted binary data endobj stream random chars"
-            
+
         def _extract_with_pdfplumber(self, pdf_path):
             self.method_call_count += 1
             logger.info("模拟pdfplumber提取返回正常文本")
             return """PhD Position in Machine Learning
             University of Oxford
             We are seeking a motivated PhD student for machine learning research."""
-            
-        def _extract_with_pypdf2(self, pdf_path):
+
+        def _extract_with_ocr(self, pdf_path):
             self.method_call_count += 1
-            logger.info("模拟PyPDF2提取（应该不会被调用）")
+            logger.info("模拟OCR提取（应该不会被调用）")
             return "Should not reach here"
     
     logger.info("\n" + "=" * 60)
@@ -1060,8 +1037,9 @@ def test_pdf_extraction_fallback():
     logger.info(f"\n最终提取结果: {result[:100] if result else 'None'}...")
     logger.info(f"调用方法次数: {mock_fetcher.method_call_count}")
     
-    if result and mock_fetcher.method_call_count == 2:
-        logger.info("✅ 候补机制测试通过：检测到乱码后成功切换到候补方法")
+    # 期望：pymupdf4llm(None) → pymupdf(乱码) → pdfplumber(正常) 共 3 档，OCR 不应触达
+    if result and mock_fetcher.method_call_count == 3:
+        logger.info("✅ 候补机制测试通过：逐档降级并在检测到乱码后切换到有效候补")
     else:
         logger.info("❌ 候补机制测试失败")
 

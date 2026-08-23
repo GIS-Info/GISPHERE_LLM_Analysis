@@ -38,9 +38,11 @@ lxml_html_clean>=0.1.0
 tqdm>=4.66.0
 
 # PDF processing
+# 分档提取：pymupdf4llm 直出结构化 Markdown（首选，免费/本地）→ PyMuPDF 裸文本 →
+# pdfplumber（表格）→ OCR → Document AI（付费 VLM 兜底）。已弃维的 PyPDF2 已移除。
 PyMuPDF>=1.23.0
+pymupdf4llm>=0.0.17
 pdfplumber>=0.9.0
-PyPDF2>=3.0.0
 
 # OCR and images
 pytesseract>=0.3.10

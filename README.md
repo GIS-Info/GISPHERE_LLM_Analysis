@@ -69,7 +69,7 @@ python -m src.tools.update_models
 - **ATS 直连 JSON/XML**（免渲染、免反爬、毫秒级）: 命中已知招聘系统时直取其公开接口，绕过整条渲染/反爬链（`ats_api`，覆盖 11 家，见「ATS 直连与学术 RSS」）
 - **多种获取方式**: HTTP、Playwright 动态渲染、PDF 解析、VLM 文档提取、Tesseract OCR、browser-use 智能代理
 - **智能页面加载**: 网络空闲、关键元素、内容/高度稳定性等多策略（`smart_page_loader`）；支持显式等待条件 `wait_for`（CSS 选择器 / JS 表达式，命中即返回，替代固定盲等）
-- **打分式正文抽取**: JSON-LD / trafilatura / resiliparse / og:description / innerText 多路候选择优（`content_extractor`）
+- **打分式正文抽取**: JobPosting(JSON-LD) / articleBody(JSON-LD) / trafilatura / resiliparse / 密度剪枝 / og:description / innerText 多路候选择优（`content_extractor`）
 - **逐页 PDF 截图**: 在线 PDF 预览器按页裁剪，保证每张恰好一页
 - **VLM 文档提取**: `document_ai` 模块通过 `VISION_MODEL_CHAIN` 调用多模态 LLM（**非** Google Cloud Document AI）
 - **多层回退**: 见下方「内容提取回退链」
@@ -199,7 +199,7 @@ flowchart LR
 flowchart TD
     U["目标 URL"] --> Q{"命中已知 ATS?"}
     Q -->|是| ATS["ATS 直连 JSON/XML<br/>毫秒级 · 免反爬"]
-    Q -->|否| H["HTTP + 打分抽取<br/>json-ld / trafilatura / resiliparse"]
+    Q -->|否| H["HTTP + 打分抽取<br/>JobPosting/JSON-LD / trafilatura / 剪枝"]
     ATS -->|失败| H
     H -->|正文不足| P["Playwright 渲染<br/>+ wait_for 显式等待"]
     P -->|正文不足| S["截图 → VLM → OCR"]
@@ -216,16 +216,16 @@ flowchart TD
 **普通网页**
 
 0. **ATS 直连 JSON/XML**（`ats_api`）：命中已知招聘系统时直取公开接口，秒回结构化正文，免渲染免反爬；未命中或失败自动回退下一级
-1. HTTP + 打分式正文抽取（`content_extractor`：JSON-LD / trafilatura / resiliparse / og / innerText 择优）
+1. HTTP + 打分式正文抽取（`content_extractor`：JobPosting JSON-LD / articleBody JSON-LD / trafilatura / resiliparse / 密度剪枝 / og / innerText 择优）
 2. Playwright 动态渲染 + 再抽取（可用 `wait_for` 显式等待关键元素）
 3. 长页/难页截图 → VLM（`document_ai`）→ Tesseract OCR
 4. **browser-use 智能代理兜底**（`browser_agent_fetcher`）：LLM 驱动浏览器多步交互（等验证页、关弹窗、展开内容）后提取正文；仅在前面全部失败后触发（Playwright 检测到验证页时跳过第 3 级直达本级）。单 URL 约 1.6万–6.3万 token，成本原因只做兜底
 
-**直链 PDF**
+**直链 PDF**（免费/本地优先，付费 VLM 仅作扫描件兜底）
 
-1. VLM（`document_ai`，`VISION_MODEL_CHAIN`）
-2. PyMuPDF → pdfplumber → PyPDF2
-3. 截图 OCR
+1. PyMuPDF4LLM（直出结构化 Markdown，首选）→ PyMuPDF 裸文本 → pdfplumber（表格）
+2. Tesseract OCR（免费本地，处理扫描件）
+3. VLM（`document_ai`，`VISION_MODEL_CHAIN`）——仅当上述全部失败（典型为扫描件且 OCR 也识别不出）才动用
 
 **在线 PDF 预览（腾讯文档等）**
 
@@ -391,6 +391,13 @@ flowchart TD
 **排错顺序**：`llm_logs/row_*.txt` → `logs/run.log` → `python -m src.tools.check_system`
 
 ## 🗓️ 更新日志
+
+### v3.4 - 2026-08
+
+- ✅ **PDF 链分档，付费 VLM 降为兜底**（省钱）：改为 `PyMuPDF4LLM(直出 Markdown) → PyMuPDF → pdfplumber → OCR → Document AI(VLM)` 分档，免费/本地优先，多模态 LLM 仅在免费档全失败（典型扫描件+OCR 也不行）才动用——此前 `USE_DOCUMENT_AI` 把付费 VLM 放在**每个 PDF 都优先跑**。顺带移除已弃维的 PyPDF2
+- ✅ **正文抽取新增密度剪枝候选**（`_extract_pruning`，移植 Crawl4AI PruningContentFilter）：纯 BeautifulSoup 零 LLM、无新依赖，按文本/链接密度+标签重要度剪枝，与 trafilatura/resiliparse 并列打分择优
+- ✅ **正文抽取新增 JobPosting JSON-LD 候选**（`_extract_jobposting_jsonld`）：识别 schema.org `JobPosting` 结构化数据，组装标题/单位/地点/描述/职责/资格等——JS 空壳招聘页只要嵌了它就能**免渲染免反爬**拿到完整正文（AJO/jobRxiv 及多数上 Google Jobs 的招聘页都嵌）
+- ❌ **camoufox 评估后不纳入**：A/B 冒烟对比显示对真实 Cloudflare 目标不比现有 patchright+真 Chrome 强、更慢、正文有时反而更少，且重（200MB 二进制/实例）——无正交增量
 
 ### v3.3 - 2026-08
 
