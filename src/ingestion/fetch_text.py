@@ -256,10 +256,19 @@ class ContentFetcher:
         except Exception:
             pass
 
+        # 在线 canvas PDF 查看器（腾讯文档 docs.qq.com/pdf 等）：正文渲染在 <canvas>，
+        # 没有 HTML 文本层。http/curl 只拿到壳页，playwright 文本模式只会抓到查看器工具栏
+        # 菜单（Log in / Annotation / PDF to Word…）并被质量门槛误判为 good，从而短路掉唯一
+        # 能读到正文的截图 OCR。因此对这类 URL 把 ocr 排到 playwright 之前，让 OCR 先出手。
+        is_canvas_pdf_viewer = self._is_canvas_pdf_viewer(url)
+
+        if is_canvas_pdf_viewer and self.screenshot_ocr_fetcher and self.playwright_manager:
+            strategy.append("ocr")
+
         if self.playwright_manager:
             strategy.append("playwright")
 
-        if self.screenshot_ocr_fetcher and self.playwright_manager:
+        if self.screenshot_ocr_fetcher and self.playwright_manager and "ocr" not in strategy:
             strategy.append("ocr")
 
         if self.browser_agent_enabled:
@@ -267,6 +276,19 @@ class ContentFetcher:
 
         logger.info(f"网页抓取策略: {strategy} ({url})")
         return strategy
+
+    @staticmethod
+    def _is_canvas_pdf_viewer(url: str) -> bool:
+        """
+        识别正文渲染在 <canvas>、无 HTML 文本层的在线 PDF 查看器 URL。
+        这类源只有截图 OCR 才能读到正文；文本抽取（http/curl/playwright 文本）只能拿到壳页或工具栏。
+        目前覆盖腾讯文档，后续可按需扩展其它同类查看器。
+        """
+        try:
+            u = (url or "").lower()
+        except Exception:
+            return False
+        return "docs.qq.com/pdf/" in u
 
     def _fetch_web_content_with_strategy(self, url: str) -> Optional[str]:
         """按统一策略链抓取网页内容，并基于内容质量逐级升级抓取方式。"""

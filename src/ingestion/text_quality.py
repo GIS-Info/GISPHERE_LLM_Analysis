@@ -145,7 +145,25 @@ def evaluate_web_content_quality(content: Optional[str]) -> Tuple[int, str, List
         "research",
         "position",
         "university",
-        "contact"
+        "contact",
+        # 中文正文特征词：不少来源（腾讯文档、公众号导出等）是纯中文正文，
+        # 只用英文关键词会误判 missing_body_keywords 而压低质量分。
+        "研究",
+        "要求",
+        "资格",
+        "截止",
+        "职责",
+        "申请",
+        "职位",
+        "岗位",
+        "大学",
+        "学院",
+        "联系",
+        "博士",
+        "招聘",
+        "方向",
+        "导师",
+        "奖学金",
     ]
     body_hits = sum(1 for keyword in body_keywords if keyword in text_lower)
     if body_hits == 0:
@@ -267,11 +285,29 @@ def is_likely_pdf_content(content: str) -> bool:
         non_ascii_chars = sum(1 for c in sample_content if ord(c) > 127)
         non_ascii_ratio = non_ascii_chars / sample_size
 
-        if non_ascii_ratio > 0.3:
-            logger.info(f"检测到高比例非ASCII字符: {non_ascii_ratio:.2%}")
+        # 高比例非 ASCII 只有在“非 CJK”时才视为 PDF 乱码/mojibake：中日韩文本天然几乎
+        # 全是非 ASCII 字符，若据此判为乱码，会误伤所有中文正文（如腾讯文档 OCR 结果）。
+        cjk_chars = sum(1 for c in sample_content if _is_cjk_char(c))
+        cjk_ratio = cjk_chars / sample_size
+
+        if non_ascii_ratio > 0.3 and cjk_ratio < 0.1:
+            logger.info(f"检测到高比例非ASCII且非CJK字符: 非ASCII={non_ascii_ratio:.2%}, CJK={cjk_ratio:.2%}")
             return True
 
     return False
+
+
+def _is_cjk_char(c: str) -> bool:
+    """判断字符是否属于常见中日韩（CJK）文字/标点范围，用于把合法东亚文本与 PDF 乱码区分开。"""
+    o = ord(c)
+    return (
+        0x4E00 <= o <= 0x9FFF or    # CJK 统一表意文字
+        0x3400 <= o <= 0x4DBF or    # CJK 扩展 A
+        0x3000 <= o <= 0x303F or    # CJK 符号与标点
+        0x3040 <= o <= 0x30FF or    # 平假名 / 片假名
+        0xAC00 <= o <= 0xD7AF or    # 谚文音节
+        0xFF00 <= o <= 0xFFEF       # 全角 ASCII / 半角片假名
+    )
 
 
 def is_unavailable_content(content: str) -> bool:

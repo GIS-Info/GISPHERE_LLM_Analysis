@@ -19,6 +19,34 @@ from ..core.api_client import NewAPIClient
 
 logger = logging.getLogger(__name__)
 
+# 发送给视觉模型前对图片降采样/压缩的参数。全页截图 PNG 常有 1~3 MB，base64 后会超过
+# 网关请求体上限（表现为 413 Request Entity Too Large），导致静默降级到精度更差的 Tesseract。
+# 限宽 + 转 JPEG 可把单图压到几百 KB，既稳过 413，又不影响 OCR/VLM 识字质量。
+VLM_IMAGE_MAX_WIDTH = 1600
+VLM_IMAGE_JPEG_QUALITY = 85
+# 超过此体积（源文件字节）才触发压缩；更小的图直接原样发送，避免无谓重编码。
+VLM_IMAGE_COMPRESS_THRESHOLD = 500 * 1024
+
+
+def _compress_image_bytes_to_data_url(raw: bytes) -> Optional[str]:
+    """把图片字节降采样并编码为 JPEG data URL；失败返回 None（调用方回退原图）。"""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        if img.width > VLM_IMAGE_MAX_WIDTH:
+            new_h = int(img.height * VLM_IMAGE_MAX_WIDTH / img.width)
+            img = img.resize((VLM_IMAGE_MAX_WIDTH, new_h), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=VLM_IMAGE_JPEG_QUALITY, optimize=True)
+        encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+        logger.info(f"图片已压缩发送 VLM: {len(raw)//1024}KB(源) -> {len(buf.getvalue())//1024}KB(JPEG), 宽={img.width}")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception as e:
+        logger.warning(f"图片压缩失败，回退原图: {e}")
+        return None
+
 
 class DocumentAIExtractor:
     """使用多模态LLM从文档/图片中提取文字"""
@@ -87,10 +115,15 @@ Extract the text now:"""
             return None
         
         try:
-            # 确定图片类型
-            media_type = self._get_media_type(image_path)
-            image_data_url = self._client.image_path_to_data_url(image_path, media_type)
-            
+            raw = image_path.read_bytes()
+            image_data_url = None
+            # 大图先压缩再发（规避网关 413）；小图或压缩失败则原样发送。
+            if len(raw) > VLM_IMAGE_COMPRESS_THRESHOLD:
+                image_data_url = _compress_image_bytes_to_data_url(raw)
+            if image_data_url is None:
+                media_type = self._get_media_type(image_path)
+                image_data_url = self._client.image_path_to_data_url(image_path, media_type)
+
             logger.info(f"Extracting text from image: {image_path.name}")
             
             extracted_text = self._extract_text_from_data_url(image_data_url)
@@ -187,15 +220,18 @@ Extract the text now:"""
                     # 转换为图片 (使用2倍分辨率提高清晰度)
                     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                     img_data = pix.tobytes("png")
-                    
-                    # 转换为 base64
-                    base64_image = base64.b64encode(img_data).decode('utf-8')
-                    
+
                     logger.info(f"Processing PDF page {page_num + 1}/{pages_to_process}")
-                    
-                    page_text = self._extract_text_from_data_url(
-                        f"data:image/png;base64,{base64_image}"
-                    )
+
+                    # 大图先压缩再发（规避网关 413）；压缩失败回退原 PNG。
+                    data_url = None
+                    if len(img_data) > VLM_IMAGE_COMPRESS_THRESHOLD:
+                        data_url = _compress_image_bytes_to_data_url(img_data)
+                    if data_url is None:
+                        base64_image = base64.b64encode(img_data).decode('utf-8')
+                        data_url = f"data:image/png;base64,{base64_image}"
+
+                    page_text = self._extract_text_from_data_url(data_url)
                     
                     if page_text and page_text.strip():
                         all_texts.append(f"--- Page {page_num + 1} ---\n{page_text.strip()}")

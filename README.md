@@ -227,9 +227,12 @@ flowchart TD
 2. Tesseract OCR（免费本地，处理扫描件）
 3. VLM（`document_ai`，`VISION_MODEL_CHAIN`）——仅当上述全部失败（典型为扫描件且 OCR 也识别不出）才动用
 
-**在线 PDF 预览（腾讯文档等）**
+**在线 PDF 预览（腾讯文档等 canvas 查看器）**
 
-1. Playwright 逐页裁剪截图 → VLM → OCR
+正文渲染在 `<canvas>`、无 HTML 文本层，故对 `docs.qq.com/pdf/` 等查看器**把截图 OCR 排到 Playwright 文本模式之前**（避免只抓到工具栏菜单被误判为成功）：
+
+1. Playwright 逐页裁剪截图 → VLM（发送前限宽+JPEG 压缩以规避网关 413）→ Tesseract OCR
+2. OCR 结果自动剥离查看器工具栏文字
 
 **Google Drive / Google Docs**
 
@@ -391,6 +394,16 @@ flowchart TD
 **排错顺序**：`llm_logs/row_*.txt` → `logs/run.log` → `python -m src.tools.check_system`
 
 ## 🗓️ 更新日志
+
+### v3.5 - 2026-08
+
+- 🐛 **修复 Playwright worker 相对导入回归（重要）**：`playwright_worker.py` 以独立脚本(`__main__`)方式在子进程运行，无父包，导致其中 6 处 `from ..core... / from .xxx` 相对导入**全部静默失效并回退默认值**——`patchright + 真 Chrome` 隐身路径、`smart_page_loader`、`wait_for`、PDF viewer 参数在子进程里其实**从未生效**。改为顶部 bootstrap 项目根到 `sys.path` + 全改绝对导入 `from src.xxx`；标准 Playwright 无 patchright 时也走 `channel="chrome"`，不再依赖可能未 `playwright install` 的捆绑 Chromium
+- 🐛 **恢复腾讯文档（在线 canvas PDF）抓取能力**：此前多重原因叠加导致 `docs.qq.com/pdf/` 一律「内容获取失败」——① 上述浏览器启动回归把截图/OCR 一起打死；② `capture_pdf_viewer_screenshots` 的 CDP 落盘路径漏 `import Path` → 每页 `NameError` → 0 张；③ 质量门槛把纯中文正文误判为「PDF 乱码」并转 PDF 下载而丢弃。逐一修复后端到端恢复（Filled 表 227 条腾讯文档链接为最大来源）
+- 🐛 **中文正文不再被误判 PDF 乱码**：`is_likely_pdf_content` 的「非 ASCII 比例 >30% 即乱码」启发式会**误伤所有中文**（中文天然全非 ASCII）；新增 CJK 判定，仅当「高非 ASCII **且** CJK 占比 <10%」才判乱码（英文 PDF 字节 / mojibake 仍能识别）
+- ✅ **在线 canvas PDF 查看器 OCR 优先路由**：`docs.qq.com/pdf/` 等查看器正文渲染在 `<canvas>`、无文本层，Playwright 文本模式只会抓到工具栏菜单并被误判为「good」而短路 OCR。对这类 URL 把截图 OCR 排到 Playwright 之前（普通 URL 顺序不变）
+- ✅ **VLM 截图压缩，规避网关 413**（省一次降级）：全页截图 PNG 常 1~3MB，base64 后超网关请求上限 → 413 → 静默降级到精度更差的 Tesseract。发 VLM 前用 Pillow 限宽 1600 + 转 JPEG q85（>500KB 才压），单图降到几百 KB，稳走高质量 VLM
+- ✅ **剥离查看器工具栏文字**：OCR 结果里的 "AI Podcast / All Translate / Split & Merge / Print" 等固定标签整行剥离（保守：仅删整行全是已知标签的行，兼容 VLM 的「每标签一行」与「整排一行多空格」两种排版）
+- ✅ **正文关键词补中文词**：质量门槛 `body_keywords` 增加 研究/要求/申请/博士/导师/奖学金 等，避免纯中文帖被误判缺正文特征
 
 ### v3.4 - 2026-08
 

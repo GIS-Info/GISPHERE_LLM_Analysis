@@ -5,10 +5,19 @@ Playwright独立进程工作器 - 完全避免异步冲突
 通过独立进程运行Playwright，与主进程完全隔离
 """
 import sys
+import os
 import json
 import logging
 from typing import Optional
 import io
+
+# 本文件由 playwright_process_manager 以独立脚本(__main__)方式启动，没有父包，
+# `from ..core...` / `from .xxx` 这类相对导入会全部抛 ImportError 并被静默吞掉，
+# 导致 patchright/真Chrome、smart_page_loader、wait_for、PDF viewer 等配置全部回退默认值。
+# 统一把项目根加入 sys.path，全文改用绝对导入 `from src.xxx import ...`。
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 # 强制 stdout 使用 UTF-8 编码，避免 Windows 上的 GBK 编码问题
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -128,11 +137,13 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
         # playwright + 捆绑 chromium（保持原有行为）。
         chrome_exe = None
         try:
-            from ..ingestion.browser_agent_fetcher import _find_browser_executable
+            from src.ingestion.browser_agent_fetcher import _find_browser_executable
             chrome_exe = _find_browser_executable()
-        except Exception:
+        except Exception as _e:
+            logger.warning(f"定位真 Chrome 失败，将回退捆绑内核: {_e}")
             chrome_exe = None
         use_patchright = False
+        use_real_chrome = bool(chrome_exe)
         if chrome_exe:
             try:
                 from patchright.sync_api import sync_playwright
@@ -140,12 +151,13 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
                 logger.info(f"使用 patchright（隐身补丁）+ 真 Chrome 启动: {chrome_exe}")
             except ImportError:
                 from playwright.sync_api import sync_playwright
+                logger.info(f"patchright 不可用，改用标准 playwright + 真 Chrome(channel=chrome): {chrome_exe}")
         else:
             from playwright.sync_api import sync_playwright
 
         # 读取 headless 配置（默认有头，降低反爬触发；可用环境变量覆盖）
         try:
-            from ..core.config import PLAYWRIGHT_HEADLESS
+            from src.core.config import PLAYWRIGHT_HEADLESS
             headless_mode = PLAYWRIGHT_HEADLESS
         except Exception:
             headless_mode = False
@@ -154,8 +166,12 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             if use_patchright:
                 # patchright 用真 Chrome，且刻意不加暴露自动化的启动参数（由补丁负责隐身）
                 browser = p.chromium.launch(headless=headless_mode, channel="chrome")
+            elif use_real_chrome:
+                # 无 patchright 但有真 Chrome：标准 playwright 也走 channel=chrome，
+                # 从根上不依赖可能未 `playwright install` 的捆绑 Chromium。
+                browser = p.chromium.launch(headless=headless_mode, channel="chrome")
             else:
-                # 标准 playwright + 捆绑 chromium（原有行为）
+                # 兜底：标准 playwright + 捆绑 chromium（需已执行 playwright install）
                 browser = p.chromium.launch(
                     headless=headless_mode,
                     args=[
@@ -257,14 +273,14 @@ def run_playwright_task(url: str, scroll_enabled: bool = True, screenshot_mode: 
             else:
                 # 非截图模式：使用智能页面加载检测
                 try:
-                    from ..core.config import (USE_SMART_PAGE_LOADER, SMART_LOAD_INITIAL_WAIT,
+                    from src.core.config import (USE_SMART_PAGE_LOADER, SMART_LOAD_INITIAL_WAIT,
                                       SMART_LOAD_MAX_WAIT, SMART_LOAD_STABILITY_INTERVAL,
                                       SMART_LOAD_STABILITY_THRESHOLD, SMART_LOAD_MIN_CONTENT_LENGTH,
                                       SMART_LOAD_MAX_RETRIES)
                     
                     if USE_SMART_PAGE_LOADER:
                         logger.info("使用智能页面加载检测...")
-                        from .smart_page_loader import create_smart_loader
+                        from src.browser.smart_page_loader import create_smart_loader
                         
                         smart_loader = create_smart_loader({
                             'max_wait_time': SMART_LOAD_MAX_WAIT,
@@ -377,7 +393,7 @@ def scroll_and_load(page):
     try:
         # 滚动参数（优先读配置）
         try:
-            from ..core.config import (SCROLL_STEP, SCROLL_DELAY, MAX_SCROLLS,
+            from src.core.config import (SCROLL_STEP, SCROLL_DELAY, MAX_SCROLLS,
                                        NO_NEW_CONTENT_THRESHOLD, SCROLL_BUFFER)
         except Exception:
             SCROLL_STEP = 500
@@ -452,7 +468,7 @@ def capture_screenshots(page, url: str) -> list:
         
         # 获取配置
         try:
-            from ..core.config import SCREENSHOT_CACHE_DIR, SCREENSHOT_MAX_PAGES, SCREENSHOT_QUALITY
+            from src.core.config import SCREENSHOT_CACHE_DIR, SCREENSHOT_MAX_PAGES, SCREENSHOT_QUALITY
         except ImportError:
             # 如果无法导入配置，使用默认值
             SCREENSHOT_CACHE_DIR = Path(__file__).parent / "cache" / "screenshots"
@@ -615,10 +631,13 @@ def capture_pdf_viewer_screenshots(page, domain: str, url_hash: str, cache_dir, 
     """在线 PDF 查看器逐页 clip 截图，确保每张恰好是完整一页。"""
     try:
         import base64
+        # 本函数独立于 capture_screenshots，需自行导入 Path：shot() 的 CDP 主路径用
+        # Path(path).write_bytes() 落盘，缺此 import 会每页抛 NameError → 0 张（腾讯文档回归根因）。
+        from pathlib import Path
 
         # 读取配置（失败回退默认值）
         try:
-            from ..core.config import (PDF_VIEWER_HIDE_UI, PDF_VIEWER_AUTO_ZOOM,
+            from src.core.config import (PDF_VIEWER_HIDE_UI, PDF_VIEWER_AUTO_ZOOM,
                                        SCREENSHOT_MAX_SHOTS, SCREENSHOT_PAGE_RENDER_WAIT_MS)
             hide_ui = PDF_VIEWER_HIDE_UI
             auto_zoom = PDF_VIEWER_AUTO_ZOOM

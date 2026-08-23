@@ -107,6 +107,8 @@ class ScreenshotOCRFetcher:
             logger.info(f"尝试使用 Document AI 处理 {len(screenshot_paths)} 张截图...")
             text = self._extract_with_document_ai(screenshot_paths)
             if text and text.strip():
+                # 剥离在线 PDF 查看器（腾讯文档等）的工具栏文字，避免污染正文开头
+                text = self._strip_viewer_chrome(text)
                 logger.info(f"✅ Document AI 提取成功，共 {len(text)} 字符")
                 # 清理截图文件
                 self._cleanup_screenshots(screenshot_paths)
@@ -296,6 +298,35 @@ class ScreenshotOCRFetcher:
             logger.warning(f"图像预处理失败，使用原图: {e}")
             return img
     
+    # 在线 PDF 查看器（腾讯文档等）固定工具栏/菜单标签，整行精确匹配才剥离。
+    _VIEWER_CHROME_LINES = {
+        'ai podcast', 'all translate', 'split & merge', 'split merge', 'extract text',
+        'adjust page', 'file compress', 'shortcut tools', 'print', 'scroll', 'rotate',
+        'annotation', 'edit', 'convert', 'reading', 'efficiency tools', 'vip exclusive',
+        'pdf to word', 'pdf to image', 'view only', 'view only. log in to edit it.',
+        'log in', 'log in now', 'log in to edit it', 'more', 'start', 'download',
+        'thumbnail', 'outline', 'zoom in', 'zoom out', '[partial]ge', '[partial] ge',
+    }
+
+    def _strip_viewer_chrome(self, text: str) -> str:
+        """
+        剥离在线 PDF 查看器工具栏文字（保守：只删“整行全部是已知标签”的行，不碰正文）。
+        VLM 有时把整排工具栏排成一行、用多个空格分隔多个标签，故按 2+ 空格切分后逐 token 校验。
+        """
+        if not text:
+            return text
+        import re
+        out = []
+        for line in text.split('\n'):
+            stripped = line.strip()
+            if stripped.lower() in self._VIEWER_CHROME_LINES:
+                continue
+            tokens = [t.strip().lower() for t in re.split(r'\s{2,}|\t', stripped) if t.strip()]
+            if tokens and all(t in self._VIEWER_CHROME_LINES for t in tokens):
+                continue
+            out.append(line)
+        return '\n'.join(out)
+
     def _clean_ocr_text(self, text: str) -> str:
         """
         清理OCR识别的文本
