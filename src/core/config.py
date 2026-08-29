@@ -116,6 +116,47 @@ SCREENSHOT_SCROLL_WAIT_MS = 250   # 每次滚动后的等待（毫秒）
 API_BASE_URL = "https://newapi.gisphere.info/v1"
 GEMINI_BASE_URL = "https://newapi.gisphere.info/v1beta"
 
+# === reasoning_effort（推理强度）开关 ===
+# 控制推理型模型（gpt-5.6 系列等）回答前"想多少"：更高档 = 更多 reasoning token
+# = 更慢更贵、复杂任务更准；简单任务无收益纯浪费。取值 low / medium / high
+# （网关不支持 minimal，会返回 400）。
+#
+# 文本 / 视觉主链：默认 None = 请求体不带该字段，沿用网关默认档（=不改变现状）。
+#   仅当显式设环境变量时才注入。实测（llm_logs/effort_*）三阶段抽取任务上
+#   low→high 准确率无差异，故默认保持不带；需要 A/B 或临时压/提质时改环境变量即可。
+def _norm_effort(val):
+    """规整 reasoning_effort：空/未知 → None（不下发）；minimal 网关不支持，降级为 low。"""
+    if not val:
+        return None
+    v = str(val).strip().lower()
+    if v in ("none", "off", "default", ""):
+        return None
+    if v == "minimal":  # 网关 400，静默降级
+        return "low"
+    return v if v in ("low", "medium", "high") else None
+
+TEXT_REASONING_EFFORT = _norm_effort(os.getenv("TEXT_REASONING_EFFORT"))
+VISION_REASONING_EFFORT = _norm_effort(os.getenv("VISION_REASONING_EFFORT"))
+# browser-use 主 agent：browser-use 的 ChatOpenAI 对 gpt-5.6（含 'gpt-5' 子串）默认
+# 就按 reasoning 模型下发 reasoning_effort='low'，故这里默认 'low' 与现状对齐。
+BROWSER_AGENT_REASONING_EFFORT = _norm_effort(os.getenv("BROWSER_AGENT_REASONING_EFFORT", "low")) or "low"
+# browser-use agent 的 use_thinking：agent 每步是否先输出一段文字推理再动作。
+# 当前为省 token 关闭（原硬编码 False）；提为可配置以便 A/B。
+BROWSER_AGENT_USE_THINKING = os.getenv("BROWSER_AGENT_USE_THINKING", "0").lower() in ("1", "true", "yes", "on")
+
+# === browser 兜底"进场即判难"的自适应 effort ===
+# browser-use 是最后一级兜底；轮到它时 HTTP 层已抓过 HTML、失败原因也已知，可零成本
+# 判断难易度：撞验证页 / 硬 ATS / 登录墙空壳 / LinkedIn 这类结构性必难页，第一次就用
+# 高 effort——避免先用 low 白跑一次撞满步数（实测 LinkedIn 内嵌文档 low 烧 ~100k token
+# 仍失败，high 反而更省且成功）。普通页面仍走默认 low。详见 [[reasoning-effort-findings]]。
+BROWSER_AGENT_EFFORT_AUTO = os.getenv("BROWSER_AGENT_EFFORT_AUTO", "1").lower() in ("1", "true", "yes", "on")
+BROWSER_AGENT_HARD_EFFORT = _norm_effort(os.getenv("BROWSER_AGENT_HARD_EFFORT", "high")) or "high"
+# HTTP 层已抓 HTML 抽出的可见文本短于此值 → 视为登录墙 / JS 空壳（难）。
+BROWSER_AGENT_HARD_MIN_TEXT = int(os.getenv("BROWSER_AGENT_HARD_MIN_TEXT", "600"))
+# 结构性必难的域名（子串匹配）：第一次就用高 effort。刻意只写高置信、高频、实测确认的
+# 少数几个（长尾几百域名多半到不了兜底，维护大表不划算）；硬 ATS 另走上面的检测。
+BROWSER_AGENT_HARD_DOMAINS = ("linkedin.com",)
+
 # === LLM 模型路由链（按效果/偏好排序，运行时逐个回退；统一走 /chat/completions）===
 # 纯文本三阶段分析使用。任一模型不可用（401/403/404/限流）时自动尝试下一个。
 # 2026-08-20 调整：网关下架了整个 gemini 系列（旧的 gemini-3.5-flash 已不存在），

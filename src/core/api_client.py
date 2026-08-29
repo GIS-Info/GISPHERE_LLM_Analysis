@@ -13,6 +13,8 @@ from .config import (
     TEXT_MODEL_CHAIN,
     VISION_MODEL_CHAIN,
     MODEL_COOLDOWN_SECONDS,
+    TEXT_REASONING_EFFORT,
+    VISION_REASONING_EFFORT,
     check_api_key,
 )
 
@@ -88,6 +90,7 @@ class NewAPIClient:
         temperature: Optional[float],
         json_mode: bool,
         timeout: Optional[int],
+        reasoning_effort: Optional[str] = None,
     ) -> str:
         """单次 /chat/completions 调用，失败抛异常。"""
         body: Dict[str, Any] = {
@@ -99,6 +102,8 @@ class NewAPIClient:
             body["temperature"] = temperature
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if reasoning_effort:  # None 时不下发，沿用网关默认档
+            body["reasoning_effort"] = reasoning_effort
 
         response = requests.post(
             f"{self.api_base_url}/chat/completions",
@@ -120,6 +125,7 @@ class NewAPIClient:
         temperature: Optional[float],
         json_mode: bool,
         timeout: Optional[int],
+        reasoning_effort: Optional[str] = None,
     ) -> Optional[str]:
         """按价格升序模型链逐个尝试，任一成功即返回；全部失败返回 None。
 
@@ -143,7 +149,8 @@ class NewAPIClient:
                 else:
                     logger.info(f"调用 /chat/completions，首选模型: {model}")
                 text = self._chat_once(
-                    model, messages, max_output_tokens, temperature, json_mode, timeout
+                    model, messages, max_output_tokens, temperature, json_mode, timeout,
+                    reasoning_effort,
                 )
                 self.last_model = model
                 logger.info(f"✅ /chat/completions 调用成功（模型: {model}）")
@@ -166,8 +173,14 @@ class NewAPIClient:
         temperature: Optional[float] = 0.1,
         json_mode: bool = True,
         timeout: Optional[int] = None,
+        reasoning_effort: Optional[str] = "__default__",
     ) -> Optional[str]:
-        """纯文本补全：走 TEXT_MODEL_CHAIN（价格升序）回退。"""
+        """纯文本补全：走 TEXT_MODEL_CHAIN（价格升序）回退。
+
+        reasoning_effort 缺省用配置项 TEXT_REASONING_EFFORT（默认 None=不下发）；
+        显式传 None 可强制不下发，传 low/medium/high 覆盖。
+        """
+        effort = TEXT_REASONING_EFFORT if reasoning_effort == "__default__" else reasoning_effort
         messages: List[Dict[str, Any]] = []
         if instructions:
             messages.append({"role": "system", "content": instructions})
@@ -179,6 +192,7 @@ class NewAPIClient:
             temperature,
             json_mode,
             timeout,
+            effort,
         )
 
     def complete_vision(
@@ -190,8 +204,13 @@ class NewAPIClient:
         temperature: Optional[float] = 0.1,
         json_mode: bool = False,
         timeout: Optional[int] = None,
+        reasoning_effort: Optional[str] = "__default__",
     ) -> Optional[str]:
-        """图片/文档（VLM）补全：走 VISION_MODEL_CHAIN（价格升序）回退。"""
+        """图片/文档（VLM）补全：走 VISION_MODEL_CHAIN（价格升序）回退。
+
+        reasoning_effort 缺省用配置项 VISION_REASONING_EFFORT（默认 None=不下发）。
+        """
+        effort = VISION_REASONING_EFFORT if reasoning_effort == "__default__" else reasoning_effort
         messages = [
             {
                 "role": "user",
@@ -208,6 +227,7 @@ class NewAPIClient:
             temperature,
             json_mode,
             timeout,
+            effort,
         )
 
     @staticmethod

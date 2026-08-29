@@ -816,10 +816,64 @@ class ContentFetcher:
             return None
         try:
             from .browser_agent_fetcher import fetch_with_browser_agent
-            return fetch_with_browser_agent(url)
+            effort = self._decide_browser_effort(url)
+            return fetch_with_browser_agent(url, effort=effort)
         except Exception as e:
             logger.error(f"browser-use 智能代理处理失败: {e}")
             return None
+
+    @staticmethod
+    def _visible_text_len(html: str) -> int:
+        """粗估 HTML 可见正文长度（去脚本/样式后取纯文本），供难易度判断。"""
+        if not html:
+            return 0
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.extract()
+            return len(re.sub(r"\s+", " ", soup.get_text(" ")).strip())
+        except Exception:
+            return 0
+
+    def _decide_browser_effort(self, url: str) -> str:
+        """进入 browser 兜底时"就地判难"，决定 reasoning_effort。
+
+        用的都是前面各级抓取已留下的零成本信号（撞验证页 / 硬 ATS / 登录墙空壳 /
+        结构性必难域名）。判为难页面直接给高档，避免先用 low 白跑一次撞满步数再重试。
+        """
+        from ..core.config import (
+            BROWSER_AGENT_EFFORT_AUTO,
+            BROWSER_AGENT_REASONING_EFFORT,
+            BROWSER_AGENT_HARD_EFFORT,
+            BROWSER_AGENT_HARD_MIN_TEXT,
+            BROWSER_AGENT_HARD_DOMAINS,
+        )
+        if not BROWSER_AGENT_EFFORT_AUTO:
+            return BROWSER_AGENT_REASONING_EFFORT
+
+        reasons = []
+        host = (url or "").lower()
+        if any(dom in host for dom in BROWSER_AGENT_HARD_DOMAINS):
+            reasons.append("hard-domain")
+        if getattr(self, "_last_http_challenge", False):
+            reasons.append("challenge-page")
+        ats = (self.last_fetch_summary or {}).get("detected_ats")
+        if ats and ats in text_quality._HEADLESS_HARD_ATS:
+            reasons.append(f"hard-ats:{ats}")
+        # 预抓 HTML 可见文本极短 → 登录墙 / JS 空壳（0 表示根本没抓到 HTML，不据此判难，
+        # 交给上面几个更明确的信号，避免误判）。
+        prefetched = self._visible_text_len(getattr(self, "_last_http_html", ""))
+        if 0 < prefetched < BROWSER_AGENT_HARD_MIN_TEXT:
+            reasons.append(f"thin-html:{prefetched}")
+
+        if reasons:
+            logger.info(
+                f"browser 兜底判为难页面（{', '.join(reasons)}），第一次即用高 effort="
+                f"{BROWSER_AGENT_HARD_EFFORT}"
+            )
+            return BROWSER_AGENT_HARD_EFFORT
+        logger.info(f"browser 兜底判为普通页面，用默认 effort={BROWSER_AGENT_REASONING_EFFORT}")
+        return BROWSER_AGENT_REASONING_EFFORT
 
     def _download_with_retry(self, url: str, timeout: int) -> Optional[requests.Response]:
         """带重试的下载功能"""

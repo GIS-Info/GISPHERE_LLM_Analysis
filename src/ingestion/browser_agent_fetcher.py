@@ -23,7 +23,9 @@ from ..core.config import (
     BROWSER_AGENT_MAX_HISTORY_ITEMS,
     BROWSER_AGENT_MAX_STEPS,
     BROWSER_AGENT_MODEL,
+    BROWSER_AGENT_REASONING_EFFORT,
     BROWSER_AGENT_TIMEOUT,
+    BROWSER_AGENT_USE_THINKING,
     BROWSER_AGENT_USE_VISION,
     PLAYWRIGHT_HEADLESS,
     check_api_key,
@@ -95,16 +97,21 @@ def is_browser_agent_available() -> bool:
         return False
 
 
-async def _run_agent(url: str, api_key: str) -> Optional[str]:
+async def _run_agent(url: str, api_key: str, effort: Optional[str] = None) -> Optional[str]:
     from browser_use import Agent, ChatOpenAI
     from browser_use.browser import BrowserSession
     from browser_use.browser.profile import BrowserProfile
 
+    effort = effort or BROWSER_AGENT_REASONING_EFFORT
     llm = ChatOpenAI(
         model=BROWSER_AGENT_MODEL,
         api_key=api_key,
         base_url=API_BASE_URL,
         temperature=0.0,
+        # 主 agent 做导航决策，reasoning_effort 影响其"想多少"。注意 browser-use 对
+        # gpt-5.6（含 'gpt-5' 子串）按 reasoning 模型处理，会下发本值并忽略 temperature。
+        # effort 由调用方按页面难易度传入（难页面用高档），缺省用配置默认（low）。
+        reasoning_effort=effort,
         # 网关不保证支持 OpenAI json_schema 结构化输出，改为注入 system prompt
         dont_force_structured_output=True,
         add_schema_to_system_prompt=True,
@@ -137,7 +144,7 @@ async def _run_agent(url: str, api_key: str) -> Optional[str]:
         # ↓ P0 调优：压 token / 减步数（详见 config.py 注释）
         page_extraction_llm=extraction_llm,
         flash_mode=BROWSER_AGENT_FLASH_MODE,
-        use_thinking=False,
+        use_thinking=BROWSER_AGENT_USE_THINKING,
         max_history_items=BROWSER_AGENT_MAX_HISTORY_ITEMS,
         directly_open_url=BROWSER_AGENT_DIRECTLY_OPEN_URL,
     )
@@ -155,9 +162,12 @@ async def _run_agent(url: str, api_key: str) -> Optional[str]:
             logger.debug(f"关闭 browser-use 会话失败（忽略）: {e}")
 
 
-def fetch_with_browser_agent(url: str) -> Optional[str]:
+def fetch_with_browser_agent(url: str, effort: Optional[str] = None) -> Optional[str]:
     """
     用 browser-use 代理抓取页面正文（同步入口）。
+
+    effort: 主 agent 的 reasoning_effort（low/medium/high）。调用方按页面难易度传入
+    （难页面直接给高档，省去先 low 白跑一次的浪费）；缺省用配置默认 low。
 
     失败（未安装、无 Key、超时、代理未完成任务）一律返回 None，由上层记录。
     """
@@ -178,11 +188,12 @@ def fetch_with_browser_agent(url: str) -> Optional[str]:
         logger.info("提示: 建议设置环境变量 PYTHONUTF8=1，避免 browser-use 在 GBK 环境下的编码错误")
 
     os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+    effort = effort or BROWSER_AGENT_REASONING_EFFORT
     logger.info(f"启动 browser-use 智能代理兜底: {url} (模型={BROWSER_AGENT_MODEL}, "
-                f"max_steps={BROWSER_AGENT_MAX_STEPS})")
+                f"effort={effort}, max_steps={BROWSER_AGENT_MAX_STEPS})")
     try:
         content = asyncio.run(
-            asyncio.wait_for(_run_agent(url, api_key), timeout=BROWSER_AGENT_TIMEOUT)
+            asyncio.wait_for(_run_agent(url, api_key, effort), timeout=BROWSER_AGENT_TIMEOUT)
         )
     except asyncio.TimeoutError:
         logger.warning(f"browser-use 代理超时（{BROWSER_AGENT_TIMEOUT}秒）: {url}")

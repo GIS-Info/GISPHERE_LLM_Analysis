@@ -172,6 +172,8 @@ MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 | `BROWSER_AGENT_MAX_HISTORY_ITEMS` | `6` | 带入上下文的最近步数（越小越省 token；库约束须 >5） |
 | `BROWSER_AGENT_FLASH_MODE` | `True` | 跳过每步推理段落、压缩 prompt（降 token） |
 | `BROWSER_AGENT_USE_VISION` | `False` | 是否给代理发截图；网关 nginx 对大请求体返回 413，默认纯 DOM 文本 |
+| `BROWSER_AGENT_REASONING_EFFORT` | `low` | 代理主模型推理强度 low/medium/high；实测普通页面调高纯浪费（token 翻倍、字段无变化），但 LinkedIn 等内嵌文档难页面上 `high` 反而更易成功且更省（详见"reasoning_effort 实测"） |
+| `BROWSER_AGENT_USE_THINKING` | `False` | 代理每步是否先文字推理再动作；实测近乎免费但收益极低 |
 | `CONTACT_VERIFICATION_ENABLED` | `True` | 是否执行联系人验证流程 |
 | `OCR_LANGUAGE` | `eng+chi_sim` | Tesseract 语言；需安装对应语言包 |
 
@@ -346,7 +348,24 @@ flowchart TD
 | `MODEL_COOLDOWN_SECONDS` | `1800` | 模型 401/403 熔断秒数 |
 | `FORCE_IPV4` | `true` | 强制 IPv4（`src/main.py`） |
 | `USE_BROWSER_AGENT` | `1` | `0` = 禁用 browser-use 智能代理兜底 |
+| `TEXT_REASONING_EFFORT` | 未设(None) | 三阶段文本分析的 reasoning_effort；未设=不下发走网关默认。取值 low/medium/high（minimal 网关不支持，自动降 low） |
+| `VISION_REASONING_EFFORT` | 未设(None) | VLM 文档理解的 reasoning_effort；同上 |
+| `BROWSER_AGENT_REASONING_EFFORT` | `low` | browser 代理主模型 reasoning_effort（普通页面默认档） |
+| `BROWSER_AGENT_USE_THINKING` | `0` | `1` = 开启 browser 代理每步文字推理 |
+| `BROWSER_AGENT_EFFORT_AUTO` | `1` | 进入 browser 兜底时"就地判难"自适应 effort；`0` = 关闭、全用上面的默认档 |
+| `BROWSER_AGENT_HARD_EFFORT` | `high` | 判为难页面（LinkedIn/验证页/硬 ATS/登录墙空壳）时用的 effort |
+| `BROWSER_AGENT_HARD_MIN_TEXT` | `600` | HTTP 层已抓 HTML 可见文本短于此值即视为登录墙/空壳→难 |
 | `PYTHONUTF8` | 未设 | Windows 建议设为 `1`：browser-use 在 GBK 默认编码下写文件遇 `\xa0` 等字符会报错 |
+
+### reasoning_effort 实测结论
+
+对上述四个开关做过真实页面实测（脚本见工作区 scratchpad，结论供调参参考）：
+
+- **文本/VLM 抽取（`TEXT_/VISION_REASONING_EFFORT`）**：三阶段抽取任务上 low→high **准确率无差异**（含刻意设的推理陷阱），高档只多烧 reasoning token + 延迟。**默认保持不下发（None）**。
+- **browser 普通页面**：能被 low 打开的页面，`high` 让 token **翻近一倍、延迟近翻倍，但抽取字段逐字相同**——联系人/邮箱/截止日 low 已 100% 正确（含两位导师时正确选主导师）。多出的那 1 步是冗余复核，非必要。
+- **browser 难页面（关键例外）**：LinkedIn 内嵌图片文档页，`low` 撞满 12 步上限、烧 98k token 仍失败（只拿到帖子摘要）；`high` **10 步成功**拿到完整正文、且 token 更少（79.6k）。死链/403 页则两档都救不回（内容本就不存在）。
+- **结论 & 已落地**：默认 `low` 保住常见页面低成本；难页面价值在高 effort。已实现**"进场即判难"自适应**（`ContentFetcher._decide_browser_effort`）——轮到 browser 兜底时，用前面各级抓取已留下的零成本信号（LinkedIn 域名 / 撞验证页 / 硬 ATS / 登录墙空壳）判难，**难页面第一次就用 `high`**，避免先 low 白跑一次撞满步数再重试的 token 浪费。由 `BROWSER_AGENT_EFFORT_AUTO` 开关控制。
+- **`use_thinking`**：开/关 token 差 <1%、字段无变化，几乎免费但也几乎无用。
 
 ## 🛠️ 常见问题
 
