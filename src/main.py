@@ -26,11 +26,16 @@ from .core.utils import check_dependencies
 from .ingestion.excel_handler import ExcelHandler
 from .ingestion.fetch_text import ContentFetcher
 from .core.analysis_stage import AnalysisStageManager
+from .core.observability import traced, flush_traces
+from .core.run_options import RunOptions, parse_run_options, select_rows, rerun_updates
+from .core.run_store import RunStore
 
 logger = logging.getLogger(__name__)
 
 class LLMAnalysisSystem:
     def __init__(self):
+        self.options = RunOptions()
+        self.run_store = RunStore()
         self.excel_handler = ExcelHandler()
         self.content_fetcher = ContentFetcher()
         self.analysis_manager = AnalysisStageManager()
@@ -101,15 +106,24 @@ class LLMAnalysisSystem:
         logger.info("环境检查通过")
         return True
     
-    def run(self) -> bool:
+    def run(self, options=None) -> bool:
         """运行主流程"""
         try:
+            self.options = options or RunOptions()
             # 初始化系统
             if not self.initialize():
                 return False
             
             # 获取待处理的行
-            unfilled_rows = self.excel_handler.get_unfilled_rows()
+            frame = (self.excel_handler.google_handler.df if self.excel_handler.use_google_sheets
+                     else self.excel_handler.df)
+            rows_by_index = {index: self.excel_handler.get_row_data(index) for index in frame.index}
+            try:
+                unfilled_rows = select_rows(rows_by_index, self.options)
+            except ValueError as exc:
+                logger.error("行选择失败，未处理或写回数据: %s", exc)
+                self._cleanup_resources()
+                return False
             
             if not unfilled_rows:
                 logger.info("没有需要处理的行")
@@ -172,6 +186,7 @@ class LLMAnalysisSystem:
         except Exception as e:
             logger.warning(f"清理资源失败: {e}")
     
+    @traced("process-row")
     def _process_single_row(self, row_index: int) -> bool:
         """处理单行数据"""
         try:
@@ -182,7 +197,7 @@ class LLMAnalysisSystem:
             if not row_data:
                 error_msg = "无法获取行数据"
                 logger.error(error_msg)
-                self.excel_handler.update_row_error(row_index, error_msg)
+                self._record_row_error(row_index, error_msg)
                 return False
             
             # 2. 提取链接
@@ -190,18 +205,28 @@ class LLMAnalysisSystem:
             if not url:
                 error_msg = "未找到有效链接"
                 logger.warning(error_msg)
-                self.excel_handler.update_row_error(row_index, error_msg)
+                self._record_row_error(row_index, error_msg)
                 return False
             
             # 3. 获取内容
             logger.info(f"获取内容: {url}")
-            content = self.content_fetcher.fetch_content(url)
-            fetch_summary = self.content_fetcher.get_last_fetch_summary()
+            source = self._source_identity()
+            content = None
+            if self.options.rerun and not self.options.refresh_content:
+                content = self.run_store.get_content(source, url)
+            if content is not None:
+                logger.info("行 %s 使用正文缓存；--refresh-content 可重新抓取", row_index)
+                fetch_summary = {}
+            else:
+                content = self.content_fetcher.fetch_content(url)
+                fetch_summary = self.content_fetcher.get_last_fetch_summary()
+                if content:
+                    self.run_store.save_content(source, url, content)
             if not content:
                 logger.error(f"抓取摘要: {fetch_summary}")
                 error_msg = "内容获取失败"
                 logger.error(error_msg)
-                self.excel_handler.update_row_error(row_index, error_msg)
+                self._record_row_error(row_index, error_msg)
                 # 如果处理的是PDF文件，删除缓存的PDF文件
                 self.content_fetcher.delete_current_pdf()
                 return False
@@ -224,7 +249,23 @@ class LLMAnalysisSystem:
             
             # 4. 分析内容
             logger.info("开始LLM分析...")
-            has_results, results, error_msg = self.analysis_manager.analyze_text_complete(content, row_index)
+            completed = (self.run_store.load_stages(source, row_index, url, content)
+                         if self.options.rerun == "failed" else {})
+            if self.options.rerun == "failed" and not completed:
+                logger.info("没有匹配的成功检查点，将执行全部阶段并保留已有字段")
+
+            def save_stage(stage, success, result, error):
+                self.run_store.save_stage(source, row_index, url, content, stage, success, result, error)
+
+            has_results, results, error_msg = self.analysis_manager.analyze_text_complete(
+                content, row_index, completed_stages=completed, on_stage_complete=save_stage)
+            if self.options.rerun:
+                summary = self.analysis_manager.last_run_summary
+                results, conflicts = rerun_updates(row_data, results, summary["successful"],
+                                                   summary["executed"], self.options.overwrite)
+                if conflicts:
+                    retained = "保留已有字段: " + ", ".join(conflicts)
+                    error_msg = f"{error_msg}; {retained}" if error_msg else retained
             
             # 检查是否为第三方网址
             final_error_msg = error_msg if error_msg else ""
@@ -255,10 +296,12 @@ class LLMAnalysisSystem:
                 
                 # 同时更新结果和错误信息（如果有）
                 update_success = self.excel_handler.update_row_data_with_error(row_index, results, final_error_msg, verifier)
+                if update_success and self.options.rerun:
+                    update_success = self.excel_handler.set_row_status(row_index, final_error_msg, verifier)
                 if not update_success:
                     final_error_msg = f"结果更新失败{'; ' + final_error_msg if final_error_msg else ''}"
                     logger.error("结果更新失败")
-                    self.excel_handler.update_row_error(row_index, final_error_msg)
+                    self._record_row_error(row_index, final_error_msg)
                     # 如果处理的是PDF文件，删除缓存的PDF文件
                     self.content_fetcher.delete_current_pdf()
                     return False
@@ -271,7 +314,7 @@ class LLMAnalysisSystem:
             else:
                 # 没有任何结果（完全失败）
                 logger.error(f"分析完全失败: {final_error_msg}")
-                self.excel_handler.update_row_error(row_index, final_error_msg)
+                self._record_row_error(row_index, final_error_msg)
                 # 如果处理的是PDF文件，删除缓存的PDF文件
                 self.content_fetcher.delete_current_pdf()
                 return False
@@ -284,7 +327,7 @@ class LLMAnalysisSystem:
         except Exception as e:
             error_msg = f"处理异常: {str(e)}"
             logger.error(error_msg)
-            self.excel_handler.update_row_error(row_index, error_msg)
+            self._record_row_error(row_index, error_msg)
             # 如果处理的是PDF文件，删除缓存的PDF文件
             self.content_fetcher.delete_current_pdf()
             # 即使发生异常也尝试保存对话记录（如果有的话）
@@ -294,6 +337,17 @@ class LLMAnalysisSystem:
                 logger.warning(f"保存对话记录失败: {save_error}")
             return False
     
+    def _record_row_error(self, row_index, message):
+        if self.options.rerun:
+            return self.excel_handler.set_row_status(row_index, message, "")
+        return self.excel_handler.update_row_error(row_index, message)
+
+    def _source_identity(self):
+        handler = self.excel_handler
+        if handler.use_google_sheets:
+            return f"google:{handler.google_handler.spreadsheet_id}:{handler.google_handler.sheet_name}"
+        return f"excel:{handler.excel_file.resolve()}:{handler.sheet_name}"
+
     def _print_final_statistics(self):
         """打印最终统计信息"""
         logger.info("\n" + "=" * 60)
@@ -317,15 +371,16 @@ class LLMAnalysisSystem:
             logger.info(f"缓存文件数: {cache_info['file_count']}")
             logger.info(f"缓存大小: {cache_info['total_size_mb']} MB")
 
-def main():
+def main(argv=None):
     """主函数"""
+    options = parse_run_options(argv)
     try:
         # 设置日志
         setup_logging()
         
         # 创建系统实例并运行
         system = LLMAnalysisSystem()
-        success = system.run()
+        success = system.run(options)
         
         # 退出码
         sys.exit(0 if success else 1)
@@ -333,6 +388,8 @@ def main():
     except Exception as e:
         logger.error(f"程序运行失败: {e}")
         sys.exit(1)
+    finally:
+        flush_traces()
 
 def test_single_row():
     """测试单行处理功能"""
@@ -365,12 +422,10 @@ def test_single_row():
             
     except Exception as e:
         logger.error(f"测试失败: {e}")
+    finally:
+        flush_traces()
 
 if __name__ == "__main__":
-    # 如果传入参数 "test"，则运行测试模式
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        test_single_row()
-    else:
-        main() 
+    main()
 
 

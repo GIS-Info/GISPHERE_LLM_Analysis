@@ -1,0 +1,71 @@
+{
+  "description": "合成的正文快照基准，不包含真实联系人。source_type 仅表示场景，不测试抓取/OCR 后端。",
+  "cases": [
+    {
+      "id": "phd_remote_sensing",
+      "source_type": "web-text",
+      "text": "Example University (示例大学), United Kingdom (英国), offers two PhD positions in remote sensing for forest monitoring. Research uses satellite imagery and deep learning. Application deadline: May 15, 2030. Contact: Professor Jane Example, jane@example.invalid.",
+      "expected": {
+        "stage1": {"Deadline": "2030-05-15", "Number_Places": "2", "Direction": "Remote sensing for forest monitoring", "University_EN": "Example University", "Contact_Name": "Dr. Jane Example", "Contact_Email": "jane@example.invalid"},
+        "stage2": {"Doctoral Student": "1", "RS": "1"},
+        "stage3": {"University_CN": "示例大学", "Country_CN": "英国", "WX_Label1": "林学", "WX_Label2": "森林监测", "WX_Label3": "深度学习", "WX_Label4": "", "WX_Label5": ""}
+      },
+      "accepted": {"stage3": {"WX_Label1": ["林学", "生态学"], "WX_Label3": ["深度学习", "机器学习"]}}
+    },
+    {
+      "id": "missing_deadline_and_contact",
+      "source_type": "web-text",
+      "text": "Research Assistant opportunity at Example University (示例大学), United Kingdom (英国). The project is Urban heat mapping using geographic information systems and spatial analysis. No application deadline, number of positions, or contact person is specified.",
+      "expected": {
+        "stage1": {"Deadline": "Soon", "Number_Places": "1", "Direction": "Urban heat mapping", "University_EN": "Example University", "Contact_Name": "-", "Contact_Email": "-"},
+        "stage2": {"Research Assistant": "1", "Urban": "1", "GIS": "1"},
+        "stage3": {"University_CN": "示例大学", "Country_CN": "英国", "WX_Label1": "环境科学", "WX_Label2": "城市热岛", "WX_Label3": "空间分析", "WX_Label4": "", "WX_Label5": ""}
+      },
+      "accepted": {"stage3": {"WX_Label1": ["环境科学", "气候学"], "WX_Label2": ["城市热岛", "城市热环境"]}}
+    },
+    {
+      "id": "conference_event",
+      "source_type": "pdf-text",
+      "text": "Conference on Coastal flood mapping, hosted by Example University (示例大学), United Kingdom (英国). This is a conference, not a student or staff vacancy. Topics: physical geography, geographic information systems, and coastal flood modelling. Application deadline for conference participation: 2030-09-01. There are no recruitment places and no named contact.",
+      "expected": {
+        "stage1": {"Deadline": "2030-09-01", "Number_Places": "", "Direction": "Coastal flood mapping", "University_EN": "Example University", "Contact_Name": "-", "Contact_Email": "-"},
+        "stage2": {"Conference": "1", "Physical_Geo": "1", "GIS": "1"},
+        "stage3": {"University_CN": "示例大学", "Country_CN": "英国", "WX_Label1": "水文学", "WX_Label2": "洪水模拟", "WX_Label3": "海岸洪水", "WX_Label4": "", "WX_Label5": ""}
+      },
+      "accepted": {"stage3": {"WX_Label1": ["水文学", "海洋科学"], "WX_Label2": ["洪水模拟", "洪水制图"]}}
+    },
+    {
+      "id": "context_year_and_first_contact",
+      "source_type": "pdf-text",
+      "text": "One PostDoc position at Example Institute (示例研究院), Canada (加拿大): GNSS positioning. The role starts in Fall 2027. Apply by January 7 (year not repeated). Contacts in this order: Dr. Alex Example (alex@example.invalid), then Professor Robin Example (robin@example.invalid).",
+      "expected": {
+        "stage1": {"Deadline": "2027-01-07", "Number_Places": "1", "Direction": "GNSS positioning", "University_EN": "Example Institute", "Contact_Name": "Dr. Alex Example", "Contact_Email": "alex@example.invalid"},
+        "stage2": {"PostDoc": "1", "GNSS": "1"},
+        "stage3": {"University_CN": "示例研究院", "Country_CN": "加拿大", "WX_Label1": "测绘学", "WX_Label2": "精密定位", "WX_Label3": "定位算法", "WX_Label4": "", "WX_Label5": ""}
+      },
+      "accepted": {"stage3": {"WX_Label1": ["测绘学", "大地测量学"], "WX_Label2": ["精密定位", "卫星定位"]}}
+    },
+    {
+      "id": "multiple_positions",
+      "source_type": "web-text",
+      "text": "Example Institute (示例研究院), Canada (加拿大), invites applications for one PhD position and two Research Assistant positions in Satellite image classification using geographic information systems and remote sensing. Deadline: 2030-06-30. Contact Dr. Alex Example at alex[at]example[dot]invalid.",
+      "expected": {
+        "stage1": {"Deadline": "2030-06-30", "Number_Places": "3", "Direction": "Satellite image classification", "University_EN": "Example Institute", "Contact_Name": "Dr. Alex Example", "Contact_Email": "alex@example.invalid"},
+        "stage2": {"Doctoral Student": "1", "Research Assistant": "1", "GIS": "1", "RS": "1"},
+        "stage3": {"University_CN": "示例研究院", "Country_CN": "加拿大", "WX_Label1": "测绘学", "WX_Label2": "图像分类", "WX_Label3": "卫星影像", "WX_Label4": "", "WX_Label5": ""}
+      },
+      "accepted": {"stage3": {"WX_Label1": ["测绘学", "地球信息学"], "WX_Label3": ["卫星影像", "影像分析"]}}
+    },
+    {
+      "id": "ocr_transcript",
+      "source_type": "ocr-transcript",
+      "text": "POSTDOC — Example University / 示例大学\nUnited Kingdom / 英国\nOne position: Satellite monitoring of glaciers.\nResearch area: physical geography and remote sensing.\nApply before 2030-02-28.\nContact: Dr. Jane Example — jane@example.invalid",
+      "expected": {
+        "stage1": {"Deadline": "2030-02-28", "Number_Places": "1", "Direction": "Satellite monitoring of glaciers", "University_EN": "Example University", "Contact_Name": "Dr. Jane Example", "Contact_Email": "jane@example.invalid"},
+        "stage2": {"PostDoc": "1", "Physical_Geo": "1", "RS": "1"},
+        "stage3": {"University_CN": "示例大学", "Country_CN": "英国", "WX_Label1": "冰川学", "WX_Label2": "冰川监测", "WX_Label3": "卫星观测", "WX_Label4": "", "WX_Label5": ""}
+      },
+      "accepted": {"stage3": {"WX_Label1": ["冰川学", "地球科学"], "WX_Label3": ["卫星观测", "卫星监测"]}}
+    }
+  ]
+}

@@ -165,18 +165,17 @@ BROWSER_AGENT_HARD_DOMAINS = ("linkedin.com",)
 #   实测 terra 性价比最高、sol 旗舰准确度最高。按用户偏好文本链也按能力最强→最弱
 #   （sol→terra→luna），luna 最慢且出现联系人/类型抽取瑕疵故垫底；其后回退 deepseek-v4-pro、model-router。
 TEXT_MODEL_CHAIN = [
+    "claude-sonnet-5-5",
     "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
     "deepseek-v4-pro",
     "model-router",
 ]
 # 图片/文档（VLM）使用：仅含支持视觉输入的模型，按能力最强→最弱排序。
 # deepseek-v4-pro / model-router 非多模态，故视觉链只保留 gpt-5.6 系列。
 VISION_MODEL_CHAIN = [
+    "claude-sonnet-5-5",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
-    "gpt-5.6-luna",
 ]
 
 # 向后兼容的单值别名（旧模块/日志仍引用）

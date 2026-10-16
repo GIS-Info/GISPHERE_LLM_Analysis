@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import numpy as np
+from ..core.result_schema import validation_errors
 
 from ..core.config import (
     EXCEL_FILE, SHEET_NAME, EXCEL_COLUMNS, check_google_credentials,
@@ -276,6 +277,22 @@ class ExcelHandler:
             return self.google_handler.save_data()
         
         return self._save_local_excel_data()
+
+    def set_row_status(self, row_index: int, error_message: str, verifier: str) -> bool:
+        """Explicit reruns replace stale statuses, including clearing empty values."""
+        target = self.google_handler if self.use_google_sheets else self
+        try:
+            if target.df is None or row_index not in target.df.index:
+                return False
+            if not all(field in target.df.columns for field in ("Error", "Verifier")):
+                return False
+            for field, value in (("Error", error_message), ("Verifier", verifier)):
+                target.df[field] = target.df[field].astype(object)
+                target.df.loc[row_index, field] = value
+            return True
+        except Exception as exc:
+            logger.error("更新重跑状态失败: %s", exc)
+            return False
     
     def _save_local_excel_data(self) -> bool:
         """保存数据到本地Excel文件"""
@@ -368,55 +385,11 @@ class ExcelHandler:
         logger.info("=" * 50)
 
 def validate_analysis_result(result: Dict, stage: str) -> bool:
-    """验证分析结果的格式"""
-    if not isinstance(result, dict):
-        logger.error(f"{stage} 分析结果不是字典格式")
-        return False
-    
-    # 阶段2特殊处理：只返回值为"1"的字段
-    if stage == 'stage2':
-        # 检查返回的字段是否都在允许的列表中
-        invalid_fields = [field for field in result.keys() if field not in STAGE2_FIELDS]
-        if invalid_fields:
-            logger.error(f"阶段2 返回了无效字段: {invalid_fields}")
-            return False
-        
-        # 检查所有字段的值是否都是"1"
-        non_one_fields = [field for field, value in result.items() if value != "1"]
-        if non_one_fields:
-            logger.error(f"阶段2 字段值不是'1': {non_one_fields}")
-            return False
-        
-        # 检查研究方向字段（至少1个，最多3个）
-        marked_geo_fields = [field for field in GEO_FIELDS if field in result]
-        
-        if len(marked_geo_fields) == 0:
-            logger.error("阶段2 至少需要标记1个研究方向字段")
-            return False
-        
-        if len(marked_geo_fields) > 3:
-            logger.error(f"阶段2 研究方向字段过多: {len(marked_geo_fields)} (最多3个)")
-            return False
-        
-        logger.info(f"阶段2 分析结果格式验证通过，返回 {len(result)} 个字段")
-        return True
-    
-    # 阶段1和阶段3：检查所有必需字段是否存在
-    stage_fields = {
-        'stage1': STAGE1_FIELDS,
-        'stage3': STAGE3_FIELDS,
-    }
-    
-    expected_fields = stage_fields.get(stage, [])
-    
-    # 检查必要字段是否存在
-    missing_fields = [field for field in expected_fields if field not in result]
-    if missing_fields:
-        logger.error(f"{stage} 分析结果缺少字段: {missing_fields}")
-        return False
-    
-    logger.info(f"{stage} 分析结果格式验证通过")
-    return True 
+    """Compatibility entry point shared with the live pipeline and evaluator."""
+    errors = validation_errors(result, stage)
+    if errors:
+        logger.error("%s 校验失败: %s", stage, "; ".join(errors))
+    return not errors
 
 
 

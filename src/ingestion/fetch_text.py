@@ -23,6 +23,7 @@ from . import text_quality
 from . import pdf_extractor
 from . import google_sources
 from . import ats_api
+from ..core.observability import traced
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ class ContentFetcher:
         """返回最近一次抓取摘要。"""
         return dict(self.last_fetch_summary)
     
+    @traced("fetch-content")
     def fetch_content(self, url: str) -> Optional[str]:
         """根据URL类型获取内容"""
         if not url:

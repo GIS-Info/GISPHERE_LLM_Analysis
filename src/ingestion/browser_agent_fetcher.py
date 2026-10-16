@@ -14,6 +14,8 @@ import logging
 import os
 import sys
 from typing import Optional
+from ..core.model_telemetry import create_browser_model
+from ..core.observability import traced
 
 from ..core.config import (
     API_BASE_URL,
@@ -98,12 +100,13 @@ def is_browser_agent_available() -> bool:
 
 
 async def _run_agent(url: str, api_key: str, effort: Optional[str] = None) -> Optional[str]:
-    from browser_use import Agent, ChatOpenAI
+    from browser_use import Agent
     from browser_use.browser import BrowserSession
     from browser_use.browser.profile import BrowserProfile
 
     effort = effort or BROWSER_AGENT_REASONING_EFFORT
-    llm = ChatOpenAI(
+    llm = create_browser_model(
+        purpose="browser-navigation",
         model=BROWSER_AGENT_MODEL,
         api_key=api_key,
         base_url=API_BASE_URL,
@@ -119,7 +122,8 @@ async def _run_agent(url: str, api_key: str, effort: Optional[str] = None) -> Op
     )
     # 页面正文抽取（extract 动作）用最便宜的轻量模型：这一步输入是整页大文本，
     # 但只做“照抄/摘录”，不需要旗舰模型；主 agent 仍用上面的模型做导航决策。
-    extraction_llm = ChatOpenAI(
+    extraction_llm = create_browser_model(
+        purpose="browser-extraction",
         model=BROWSER_AGENT_EXTRACTION_MODEL,
         api_key=api_key,
         base_url=API_BASE_URL,
@@ -162,6 +166,7 @@ async def _run_agent(url: str, api_key: str, effort: Optional[str] = None) -> Op
             logger.debug(f"关闭 browser-use 会话失败（忽略）: {e}")
 
 
+@traced("browser-agent")
 def fetch_with_browser_agent(url: str, effort: Optional[str] = None) -> Optional[str]:
     """
     用 browser-use 代理抓取页面正文（同步入口）。

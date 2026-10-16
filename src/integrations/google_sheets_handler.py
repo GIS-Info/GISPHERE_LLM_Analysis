@@ -1,6 +1,15 @@
 """
 Google Sheets API处理模块
 """
+import socket
+import ssl
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httplib2
+import requests
+from google_auth_httplib2 import AuthorizedHttp
+
 import os
 import pickle
 import pandas as pd
@@ -36,8 +45,100 @@ class GoogleSheetsHandler:
         self.df = None
         self.original_df = None
         self.sheet_id = None  # 用于批量操作
-        
+        self.google_http = None
+        self.google_session = None
+
+    def _select_google_transport(self):
+        """优先直连；网络连接失败时，尝试本机配置的备用代理。"""
+        if self.google_http is not None:
+            return
+
+        proxy_file = (
+            Path(__file__).resolve().parents[2]
+            / "keys"
+            / "google_proxy.txt"
+        )
+        proxy_url = (
+            proxy_file.read_text(encoding="utf-8-sig").strip()
+            if proxy_file.exists()
+            else ""
+        )
+
+        # 显式禁用环境代理，让 Google 请求先测试直连。
+        http = httplib2.Http(proxy_info=None, timeout=10)
+        selected_proxy = None
+
+        if proxy_url:
+            try:
+                # 无需登录；任何 HTTP 响应都说明 HTTPS 连接已建立。
+                http.request(
+                    "https://sheets.googleapis.com/",
+                    method="GET",
+                )
+                logger.info("Google 直连可用")
+            except ssl.SSLError:
+                # 证书等 TLS 错误不通过切换代理处理。
+                http.close()
+                raise
+            except (socket.timeout, ConnectionError,
+                    socket.gaierror, httplib2.ServerNotFoundError):
+                http.close()
+
+                parsed = urlparse(proxy_url)
+                if (
+                    parsed.scheme != "http"
+                    or not parsed.hostname
+                    or not parsed.port
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    raise ValueError(
+                        "google_proxy.txt 应填写无账号密码的 HTTP 代理，"
+                        "例如 http://127.0.0.1:7897"
+                    )
+
+                logger.warning(
+                    "Google 直连失败，正在测试本机备用代理"
+                )
+
+                http = httplib2.Http(
+                    proxy_info=httplib2.ProxyInfo(
+                        proxy_type=3,  # HTTP 代理
+                        proxy_host=parsed.hostname,
+                        proxy_port=parsed.port,
+                    ),
+                    timeout=20,
+                )
+
+                try:
+                    http.request(
+                        "https://sheets.googleapis.com/",
+                        method="GET",
+                    )
+                except Exception:
+                    http.close()
+                    raise
+
+                selected_proxy = proxy_url
+                logger.info("Google 备用代理连接成功")
+
+        # 同一运行期间复用选定的 Google 连接。
+        http.timeout = 60
+
+        # 凭据刷新使用 requests，也只为该 Session 设置代理。
+        session = requests.Session()
+        session.trust_env = False
+        if selected_proxy:
+            session.proxies.update({
+                "http": selected_proxy,
+                "https": selected_proxy,
+            })
+
+        self.google_http = http
+        self.google_session = session
+
     def authorize_credentials(self):
+        self._select_google_transport()
         """授权Google API凭据"""
         creds = None
         
@@ -53,7 +154,7 @@ class GoogleSheetsHandler:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
-                    creds.refresh(Request())
+                    creds.refresh(Request(session=self.google_session))
                     logger.info("凭据刷新成功")
                 except Exception as e:
                     logger.warning(f"凭据刷新失败: {e}")
@@ -64,7 +165,14 @@ class GoogleSheetsHandler:
                     raise FileNotFoundError(f"Google凭据文件不存在: {GOOGLE_CREDENTIALS_FILE}")
                 
                 flow = InstalledAppFlow.from_client_secrets_file(
-                    str(GOOGLE_CREDENTIALS_FILE), self.scopes)
+                    str(GOOGLE_CREDENTIALS_FILE), self.scopes
+                )
+
+                flow.oauth2session.trust_env = False
+                flow.oauth2session.proxies.update(
+                    self.google_session.proxies
+                )
+
                 creds = flow.run_local_server(port=0)
                 logger.info("获取新的授权凭据成功")
             
@@ -82,8 +190,17 @@ class GoogleSheetsHandler:
         """初始化Google Sheets服务"""
         if self.service is None:
             creds = self.authorize_credentials()
-            # 禁用文件缓存以避免警告（file_cache is only supported with oauth2client<4.0.0）
-            self.service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
+
+            self.service = build(
+                "sheets",
+                "v4",
+                http=AuthorizedHttp(
+                    creds,
+                    http=self.google_http,
+                ),
+                cache_discovery=False,
+            )
+
             logger.info("Google Sheets API服务初始化成功")
     
     def fetch_data(self, range_name: str) -> List[List]:

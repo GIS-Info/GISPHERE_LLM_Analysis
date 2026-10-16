@@ -36,6 +36,35 @@ your-api-key-here
 
 > 若 `api_key.txt` 不存在，程序仍兼容旧的 `keys/openai_key.txt` 文件名。
 
+#### 配置 Langfuse（可选）
+
+1. 在 Langfuse Cloud 注册/登录，创建 Organization 和 Project（例如 `GISource-LLM-Analysis`）；已有项目可直接使用。
+2. 进入项目的 **Settings → API Keys**，创建一组项目凭据，保存 **Public Key**（`pk-lf-...`）和 **Secret Key**（`sk-lf-...`）。这组凭据用于追踪上报，与 `keys/api_key.txt` 中调用模型的网关密钥不同。
+3. 将根目录 [`langfuse.env.example`](langfuse.env.example) 复制为 `keys/langfuse.env`，填入上述凭据及项目所在区域的 `LANGFUSE_BASE_URL`：EU 为 `https://cloud.langfuse.com`，US 为 `https://us.cloud.langfuse.com`，Japan 为 `https://jp.cloud.langfuse.com`；自部署则使用自己的实例地址。区域必须与创建项目时一致。
+4. 安装更新后的依赖，执行 `python -m src.tools.check_langfuse`，验证凭据并发送 `langfuse-connection-check` 测试 trace。此自检不调用模型、不处理或写入数据表；在 Langfuse 的 **Tracing** 页面确认收到记录。
+5. 正常运行后，在 Tracing 页面查找 `process-row`，展开内容抓取、三阶段分析与 `chat-completion`。也可使用 `python main.py test` 测试一行，**该命令会真实处理一行并写回数据表**。首次上报可能稍有延迟。
+
+也可以直接设置同名环境变量；进程环境变量优先于文件。`keys/` 已被 Git 忽略，请勿提交真实密钥。首次运行无需创建 Prompt、Dataset 或评估器。
+
+每行一条 trace，模型回退与参数兼容重试各自生成 generation，记录请求模型、参数、耗时、成功/失败，以及网关响应提供的 token 用量。未配置凭据时禁用追踪；SDK 不可用或追踪出错时，业务继续运行。程序退出时会尝试 flush 待上报事件。
+
+默认上传文本 prompt、抓取正文和分析结果，内联图片/PDF 的 base64 数据不上传。设置 `LANGFUSE_CAPTURE_CONTENT=false` 可关闭本项目埋点的输入/输出上传，保留耗时、状态、模型和 token 等信息；设置 `LANGFUSE_TRACING_ENABLED=false` 可关闭整个接入。
+
+模型调用覆盖范围：
+
+- New API `/chat/completions` 文本/VLM：每次 HTTP 请求分别记录 generation；模型链、参数兼容重试和失败回退保留原行为。
+- 联系人页面选择、页面分析、搜索结果解读，以及研究方向提取/判定：使用具名 span 区分用途，下挂实际模型 generation。
+- VLM 文档/图片正文提取：`vlm-extract-text` span 下记录模型调用。
+- browser-use：`browser-agent` 下分别记录 `browser-navigation` 和 `browser-extraction`，覆盖纯文本及结构化输出分支，记录实际序列化的消息。一个 generation 对应一次 OpenAI SDK 调用；SDK 内部的 HTTP 重试聚合在其中，代理层再次调用则生成新记录。
+- Ollama：`ollama-generate` 与实际调用 `/api/generate` 的 `ollama-context-reset`，记录本地模型返回的 token 数量。
+- 备用 `/responses` 文本/图片接口与 Gemini 原生 `generateContent` 均有 generation。
+
+记录 HTTP 状态、网关错误 code/param/message、异常原因，以及服务端提供的原始用量。缓存命中和推理 token 按互不重叠的桶拆分，避免重复计数；服务端缺少用量时不伪造。内联图片/PDF 数据在上述各接口中均被过滤。成本估算取决于 Langfuse 对模型名称和价格的识别，网关别名或自定义价格需要在 Langfuse 中配置，不能视为网关账单。用量拆分遵循 [Langfuse token 统计规则](https://langfuse.com/docs/observability/features/token-and-cost-tracking)。
+
+这部分覆盖模型调用；行级最终保存、业务状态及批次统计仍沿用原流程，不能将行 trace 的返回值作为数据已成功落盘的证明。
+
+参考：[Langfuse 接入文档](https://langfuse.com/docs/observability/get-started)。
+
 #### 配置数据源
 
 **Google Sheets 模式**：
@@ -63,6 +92,50 @@ python -m src.tools.update_models
 ```
 
 ## 🌟 主要特性
+
+### 指定行、失败阶段重跑与评测
+
+无参数的 `python main.py` 仍只处理 `Verifier`、`Error` 均为空的行。下面命令中的行号均为**表格显示行号**：第 1 行是标题，第 2 行对应旧日志中的索引 0。所有处理/重跑命令都会调用模型并写回业务表格；仅帮助、基准校验、历史预测评分不会。
+
+```powershell
+# 仅从指定行中选择原本待处理的行
+python main.py --rows 2,5-8 --limit 3
+
+# 重跑指定失败行，复用有效的正文缓存和成功阶段检查点
+python main.py --rows 5-8 --rerun failed
+
+# 不指定行时，选择 Verifier 为空、Error 非空且不是 N 的失败行
+python main.py --rerun failed --limit 5
+
+# 指定行全部阶段重新分析；默认仍保留已有非空字段
+python main.py --rows 5 --rerun all
+
+# 显式允许覆盖本次成功重跑阶段的字段，并重新抓取正文
+python main.py --rows 5 --rerun all --overwrite --refresh-content
+```
+
+重跑默认只补空值；已有非空字段与新结果不一致时保留原值，在 `Error` 中列出冲突字段，`Verifier` 不标为 `LLM`。`--overwrite` 仅覆盖实际重新执行且成功的阶段，不能清空失败阶段或覆盖复用阶段的人工修改；阶段二成功覆盖时也会清除该阶段不再适用的旧分类。重跑会更新或清除旧的 `Error/Verifier` 状态，不需要手工清空它们。`--rerun all` 强制要求 `--rows`，防止意外重跑整表；不增加自动付费重试次数。
+
+正文和阶段结果保存在已被 Git 忽略的 `cache/runs/` 下，包含业务文本，请按本地数据管理。默认运行仍重新抓取，只在显式重跑时复用最多 7 天的正文缓存；使用 `--refresh-content` 可跳过正文缓存。阶段复用要求数据源、行、URL、正文哈希、相关代码和模型配置版本匹配，且结果通过当前校验。阶段一 prompt 包含当前日期，因此跨天会重新执行阶段一。旧运行没有检查点时会重新分析全部阶段，并明确记日志；不能从几个已填写字段推断某阶段成功。
+
+字段校验统一由 `src/core/result_schema.py` 提供：拒绝未知字段、缺失字段和错误类型，校验真实日期及正整数招生人数；分类字段必须为字符串 `"1"`、地理方向为 1–3 个，保留原有方向二次验证；中文名称不能含英文/数字/符号，标签最多六个汉字，`WX_Label1` 必填，`WX_Label4/5` 留空。阶段三 prompt 的示例也已与规则对齐。当前字符检查只判断汉字范围，不自动做繁简转换。
+
+固定基准位于 `tests/fixtures/evaluation_cases.json`，包含 6 个合成正文快照、18 个阶段参考结果与部分可接受同义标签，覆盖网页正文、PDF 正文、OCR 转录、缺失联系人、多职位和上下文年份。它不测试真实网页抓取或 OCR 引擎，也不代表已测得真实模型准确率。
+
+```powershell
+# 零模型调用：检查合成基准的格式与参考结果
+python -m src.tools.evaluate --check-fixtures
+
+# 零模型调用：对已保存的预测重新评分
+python -m src.tools.evaluate --predictions cache/evaluations/your-run.json
+
+# 明确付费/真实调用开关；只做文本阶段评测，不写业务表格，不执行联系人网络搜索
+python -m src.tools.evaluate --live
+```
+
+真实评测结果默认保存在 `cache/evaluations/`；也可用 `--output` 指定路径。报告包含 schema 合格率、案例/阶段准确率、字段准确率和分类 precision/recall/F1，并列出不一致字段。`--live` 会使用现有模型路由；结果需要人工复核，尤其是表达不同但语义合理的标签。当前实现期间未发起真实模型评测。
+
+离线回归测试：`python -m unittest discover -s tests -v`。测试使用模拟模型和临时表格数据，不会处理真实业务行。
 
 ### 内容提取能力
 
@@ -149,9 +222,9 @@ LICENSE
 ```python
 API_BASE_URL = "https://newapi.gisphere.info/v1"
 
-# 价格升序回退：sol 旗舰 → terra 中端 → luna 轻量 → deepseek → 路由
-TEXT_MODEL_CHAIN   = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4-pro", "model-router"]
-VISION_MODEL_CHAIN = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]  # 仅保留多模态模型
+# 按配置偏好依次回退，非价格升序
+TEXT_MODEL_CHAIN   = ["claude-sonnet-5-5", "gpt-5.6-sol", "deepseek-v4-pro", "model-router"]
+VISION_MODEL_CHAIN = ["claude-sonnet-5-5", "gpt-5.6-sol", "gpt-5.6-terra"]  # 仅保留多模态模型
 
 MODEL_COOLDOWN_SECONDS = 1800  # 401/403 熔断时长（秒）
 ```

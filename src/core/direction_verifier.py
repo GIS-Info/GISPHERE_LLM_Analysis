@@ -5,6 +5,7 @@
 import logging
 import time
 from typing import Optional, Dict, List, Tuple
+from .observability import traced
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class DirectionVerifier:
         res = extract_json_object(text)
         return res if isinstance(res, dict) else {}
         
+    @traced("direction-extract")
     def _extract_actual_directions(self, text: str) -> List[str]:
         """步骤A：从原文中提取真实的 1-3 个研究方向/工作内容"""
         prompt = f"""Please analyze the following academic or job posting text and extract the TOP 1-3 actual research directions, project topics, or core work responsibilities mentioned.
@@ -94,6 +96,7 @@ Expected JSON Format:
             
         return ""
         
+    @traced("direction-evaluate")
     def _evaluate_directions(self, original_text: str, directions: List[str], search_context: str) -> Dict[str, str]:
         """步骤C：结合搜索到的上下文，让 LLM 做最终定夺"""
         directions_str = ", ".join(directions)

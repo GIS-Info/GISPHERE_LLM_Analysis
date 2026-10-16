@@ -17,6 +17,8 @@ from .config import (
     check_openai_key,
 )
 from .api_client import NewAPIClient
+from .model_telemetry import model_post
+from .observability import observation, record_http_error, record_model_response, traced
 from .utils import validate_json_response, save_llm_conversation, check_ollama_availability
 
 logger = logging.getLogger(__name__)
@@ -87,7 +89,17 @@ class LLMAgent:
                 }
             }
             
-            response = requests.post(reset_url, json=reset_data, timeout=10)
+            with observation("ollama-context-reset", as_type="generation", model=OLLAMA_MODEL,
+                             input=reset_data["prompt"], model_parameters=reset_data["options"]) as generation:
+                response = requests.post(reset_url, json=reset_data, timeout=10)
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                        record_model_response(generation, payload, payload.get("response", ""), "ollama")
+                    except (ValueError, AttributeError):
+                        generation.update(level="WARNING", status_message="Reset returned non-JSON response")
+                else:
+                    record_http_error(generation, response)
             if response.status_code == 200:
                 logger.info("Ollama上下文重置成功")
             else:
@@ -96,6 +108,7 @@ class LLMAgent:
         except Exception as e:
             logger.warning(f"Ollama上下文重置异常: {e}")
     
+    @traced("llm-call")
     def call_llm(self, prompt: str, system_prompt: str = None) -> Optional[str]:
         """调用LLM获取响应"""
         try:
@@ -155,11 +168,12 @@ class LLMAgent:
             
             logger.info("调用Ollama API...")
             
-            response = requests.post(url, json=data, timeout=180)  # 增加超时时间
+            response, result = model_post(
+                name="ollama-generate", url=url, body=data, headers=None, timeout=180,
+                extract_text=lambda payload: payload.get("response", ""), protocol="ollama",
+                model=OLLAMA_MODEL, input=full_prompt, parameters=data["options"],
+            )
             response.raise_for_status()
-            
-            result_data = response.json()
-            result = result_data.get('response', '')
             
             logger.info("Ollama API调用成功")
             return result
@@ -391,8 +405,8 @@ IMPORTANT: Analyze the actual text content to determine which categories apply. 
   "WX_Label1": "数据科学",
   "WX_Label2": "环境监测",
   "WX_Label3": "机器学习",
-  "WX_Label4": "统计分析",
-  "WX_Label5": "算法优化"
+  "WX_Label4": "",
+  "WX_Label5": ""
 }}
 
 重要提醒：请从上述文本中提取真实信息，而不是使用示例中的值。

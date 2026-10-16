@@ -16,6 +16,7 @@ from ..core.config import (
     check_openai_key
 )
 from ..core.api_client import NewAPIClient
+from ..core.observability import traced
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,7 @@ Extract the text now:"""
             logger.error(f"Document AI PDF extraction failed: {e}")
             return None
 
+    @traced("vlm-extract-text")
     def _extract_text_from_data_url(self, image_data_url: str) -> Optional[str]:
         """走 VISION_MODEL_CHAIN（价格升序）回退的 /chat/completions 视觉调用。"""
         prompt = f"{self.EXTRACTION_SYSTEM_PROMPT}\n\n{self.EXTRACTION_USER_PROMPT}"

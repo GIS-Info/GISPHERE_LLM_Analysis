@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlparse, parse_qs, unquote
 from .config import (REQUEST_TIMEOUT, MAX_RETRIES, CONTACT_VERIFICATION_ENABLED,
                     CONTACT_SEARCH_TIMEOUT, MAX_SEARCH_RESULTS, MAX_PAGES_TO_ANALYZE)
 from .utils import normalize_text, is_valid_url, clean_email_format
+from .observability import traced
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +328,7 @@ class ContactVerifier:
 
         return results
 
+    @traced("contact-search-and-interpret")
     def _mcp_search(self, query: str) -> List[Dict]:
         """
         通过 Playwright MCP 执行 Google 搜索，用 LLM 从页面快照中提取结果列表。
@@ -913,6 +915,7 @@ Snapshot 内容：
         # ── 其余 URL 一律拒绝 ─────────────────────────────────────
         return False
 
+    @traced("contact-select-pages")
     def _select_relevant_pages(self, search_results: List[Dict],
                                 contact_name: str) -> List[str]:
         """使用 LLM 从搜索结果中选择最相关的页面 URL"""
@@ -1005,6 +1008,7 @@ Return JSON only:
             logger.warning(f"HTTP 获取页面内容失败 {url}: {e}")
             return None
 
+    @traced("contact-analyze-page")
     def _analyze_page_with_llm(self, page_content: str, contact_name: str) -> Optional[Dict]:
         """使用 LLM 分析页面内容，提取学位和邮箱信息"""
         prompt = f"""Please analyze the following web page content and extract relevant information about contact person "{contact_name}".

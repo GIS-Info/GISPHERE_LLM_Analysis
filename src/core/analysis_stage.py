@@ -1,10 +1,12 @@
-﻿"""
+"""
 分析阶段封装模块
 """
 import os
 import logging
 from typing import Dict, Optional, Tuple
 from .llm_agent import LLMAgent
+from .observability import traced
+from .result_schema import validation_errors, valid_deadline, STAGE_FIELDS
 from ..ingestion.excel_handler import validate_analysis_result
 from .contact_verifier import ContactVerifier
 from .direction_verifier import DirectionVerifier
@@ -47,110 +49,59 @@ class AnalysisStageManager:
         self.direction_verifier = DirectionVerifier(self.llm_agent, mcp_client=self.mcp_client)
         self.current_row_index = None
         
-    def analyze_text_complete(self, text: str, row_index: int) -> Tuple[bool, Dict, str]:
-        """
-        完整的三阶段文本分析
-        现在支持部分成功：即使某个阶段失败，也会继续执行后续阶段并保存已完成的结果
-        
-        Args:
-            text: 待分析的文本内容
-            row_index: 当前处理的行索引
-            
-        Returns:
-            Tuple[bool, Dict, str]: (是否完全成功, 结果字典(包含部分结果), 错误信息)
-        """
+    @traced("three-stage-analysis")
+    def analyze_text_complete(self, text: str, row_index: int, *,
+                              completed_stages=None, on_stage_complete=None) -> Tuple[bool, Dict, str]:
+        """Run three stages; reuse only validated checkpoints supplied by the caller."""
         self.current_row_index = row_index
-        logger.info(f"开始对行 {row_index} 进行三阶段分析")
-        
-        # 重置对话保存标志，确保新的行可以保存对话记录
         self.llm_agent.conversation_saved = False
-        
+        summary = {"executed": [], "reused": [], "successful": [], "failed": {}}
+        self.last_run_summary = summary
+        final_result = {}
+        cached = completed_stages or {}
         try:
-            # 合并所有分析结果
-            final_result = {}
-            failed_stages = []
-            completed_stages = []
-            
-            # 阶段1：英文基本信息提取
-            logger.info("执行阶段1分析...")
-            success, stage1_result, error = self._execute_stage1(text)
-            if success:
-                final_result.update(stage1_result)
-                completed_stages.append("阶段1(英文基本信息)")
-                logger.info("阶段1分析成功")
-            else:
-                failed_stages.append(f"阶段1失败: {error}")
-                logger.error(f"阶段1分析失败: {error}")
-            
-            # 阶段2：类型和方向分析
-            logger.info("执行阶段2分析...")
-            success, stage2_result, error = self._execute_stage2(text)
-            if success:
-                final_result.update(stage2_result)
-                completed_stages.append("阶段2(类型和方向)")
-                logger.info("阶段2分析成功")
-            else:
-                failed_stages.append(f"阶段2失败: {error}")
-                logger.error(f"阶段2分析失败: {error}")
-            
-            # 阶段3：中文字段提取
-            logger.info("执行阶段3分析...")
-            success, stage3_result, error = self._execute_stage3(text)
-            if success:
-                final_result.update(stage3_result)
-                completed_stages.append("阶段3(中文信息)")
-                logger.info("阶段3分析成功")
-            else:
-                failed_stages.append(f"阶段3失败: {error}")
-                logger.error(f"阶段3分析失败: {error}")
-            
-            # 后处理：数据格式化和验证（只对已获得的结果进行处理）
+            for stage, execute in (("stage1", self._execute_stage1),
+                                   ("stage2", self._execute_stage2),
+                                   ("stage3", self._execute_stage3)):
+                if stage in cached and not validation_errors(cached[stage], stage):
+                    success, result, error = True, dict(cached[stage]), ""
+                    summary["reused"].append(stage)
+                    logger.info("行 %s 复用 %s 成功检查点", row_index, stage)
+                else:
+                    summary["executed"].append(stage)
+                    try:
+                        success, result, error = execute(text)
+                        if success:
+                            errors = validation_errors(result, stage)
+                            if errors:
+                                success, error = False, "; ".join(errors)
+                    except Exception as exc:
+                        success, result, error = False, {}, str(exc)
+                    if on_stage_complete is not None:
+                        try:
+                            on_stage_complete(stage, success, result, error)
+                        except Exception as exc:
+                            logger.warning("检查点保存失败，继续分析: %s", exc)
+                if success:
+                    summary["successful"].append(stage)
+                    final_result.update(result)
+                else:
+                    summary["failed"][stage] = error or "阶段返回失败"
             if final_result:
                 final_result = self._post_process_results(final_result)
-            
-            # 确定最终状态
-            all_success = len(failed_stages) == 0
-            has_partial_results = len(completed_stages) > 0
-            
-            # 构建状态信息
-            if all_success:
-                status_msg = f"行 {row_index} 三阶段分析全部完成"
-                error_msg = ""
-            elif has_partial_results:
-                status_msg = f"行 {row_index} 部分分析完成。已完成: {', '.join(completed_stages)}"
-                error_msg = "; ".join(failed_stages)
-            else:
-                status_msg = f"行 {row_index} 所有阶段分析失败"
-                error_msg = "; ".join(failed_stages)
-            
-            logger.info(status_msg)
-            logger.info(
-                f"分析摘要: completed={completed_stages if completed_stages else ['none']}, "
-                f"failed={failed_stages if failed_stages else ['none']}, "
-                f"result_fields={sorted(final_result.keys()) if final_result else []}"
-            )
-            if error_msg:
-                logger.warning(f"部分阶段失败: {error_msg}")
-            
-            # 总是保存对话记录
+            errors = [f"阶段{stage[-1]}失败: {error}" for stage, error in summary["failed"].items()]
+            logger.info("行 %s 分析摘要: %s", row_index, summary)
+            return bool(summary["successful"]), final_result, "; ".join(errors)
+        except Exception as exc:
+            logger.exception("分析编排异常")
+            return False, {}, f"分析过程发生异常: {exc}"
+        finally:
             try:
                 self.llm_agent.save_conversation_log(row_index)
-            except Exception as save_error:
-                logger.warning(f"保存对话记录失败: {save_error}")
-            
-            # 返回结果：如果有任何成功的结果就返回True和结果，错误信息用于记录到Error列
-            return has_partial_results, final_result, error_msg
-            
-        except Exception as e:
-            error_msg = f"分析过程发生异常: {str(e)}"
-            logger.error(error_msg)
-            # 即使发生异常也保存对话记录
-            try:
-                self.llm_agent.save_conversation_log(row_index)
-            except Exception as save_error:
-                logger.error(f"保存对话记录失败: {save_error}")
-            return False, {}, error_msg
+            except Exception as exc:
+                logger.warning("保存对话记录失败: %s", exc)
     
+    @traced("stage1-english-and-contact")
     def _execute_stage1(self, text: str) -> Tuple[bool, Dict, str]:
         """执行阶段1分析（包含联系人验证）"""
         logger.info("执行英文分析阶段1（含联系人验证）")
@@ -167,8 +118,9 @@ class AnalysisStageManager:
                 return False, {}, "LLM返回空结果"
             
             # 验证结果格式
-            if not validate_analysis_result(result, 'stage1'):
-                return False, {}, "结果格式验证失败"
+            errors = validation_errors(result, "stage1")
+            if errors:
+                return False, {}, "; ".join(errors)
             
             logger.info("基本信息提取完成")
             
@@ -276,6 +228,7 @@ class AnalysisStageManager:
         """析构函数，确保资源被清理"""
         self.cleanup()
     
+    @traced("stage2-type-and-direction")
     def _execute_stage2(self, text: str) -> Tuple[bool, Dict, str]:
         """执行阶段2分析"""
         logger.info("执行英文分析阶段2")
@@ -290,11 +243,9 @@ class AnalysisStageManager:
             if not result:
                 return False, {}, "LLM返回空结果"
             
-            # 验证结果格式（现在只返回值为"1"的字段）
-            # 确保所有返回的字段值都是"1"
-            for key, value in result.items():
-                if value != "1":
-                    return False, {}, f"字段 {key} 的值不是 '1'，而是 '{value}'"
+            errors = validation_errors(result, "stage2", require_geo=False)
+            if errors:
+                return False, {}, "; ".join(errors)
             
             # 验证专业方向字段数量（最多3个，最少1个）
             marked_fields = [field for field in GEO_FIELDS if field in result and result[field] == "1"]
@@ -307,6 +258,9 @@ class AnalysisStageManager:
                     verified_fields = self.direction_verifier.verify_and_map_direction(text)
                     if verified_fields:
                         result.update(verified_fields)
+                        errors = validation_errors(result, "stage2")
+                        if errors:
+                            return False, {}, "; ".join(errors)
                         logger.info(f"阶段2通过二次验证，补充字段: {list(verified_fields.keys())}")
                         return True, result, ""
                 
@@ -314,6 +268,8 @@ class AnalysisStageManager:
             elif len(marked_fields) > 3:
                 return False, {}, f"标记了{len(marked_fields)}个专业方向，超过最大限制3个"
             
+            if not validate_analysis_result(result, "stage2"):
+                return False, {}, "; ".join(validation_errors(result, "stage2"))
             logger.info(f"阶段2分析成功，返回 {len(result)} 个字段: {list(result.keys())}")
             return True, result, ""
             
@@ -322,6 +278,7 @@ class AnalysisStageManager:
             logger.error(error_msg)
             return False, {}, error_msg
     
+    @traced("stage3-chinese-fields")
     def _execute_stage3(self, text: str) -> Tuple[bool, Dict, str]:
         """执行阶段3分析"""
         logger.info("执行中文分析阶段")
@@ -337,8 +294,9 @@ class AnalysisStageManager:
                 return False, {}, "LLM返回空结果"
             
             # 验证结果格式
-            if not validate_analysis_result(result, 'stage3'):
-                return False, {}, "结果格式验证失败"
+            errors = validation_errors(result, "stage3")
+            if errors:
+                return False, {}, "; ".join(errors)
             
             # WX_Label1必须有内容
             if not result.get('WX_Label1') or result['WX_Label1'].strip() == "":
@@ -437,7 +395,7 @@ class AnalysisStageManager:
         if deadline and deadline != "Soon":
             import re
             # 简单的日期格式验证
-            if not re.match(r'\d{4}-\d{2}-\d{2}', deadline):
+            if not valid_deadline(deadline):
                 raise ValueError(f"Deadline格式不正确: {deadline}，应为YYYY-MM-DD格式或'Soon'")
         
         # 规则3：联系人信息一致性

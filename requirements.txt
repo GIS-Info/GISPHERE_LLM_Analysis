@@ -18,6 +18,10 @@
 # Core HTTP/API (New API gateway via requests; no openai SDK)
 requests>=2.31.0
 urllib3>=2.0.0
+
+# Optional at runtime: enabled only when Langfuse project keys are configured
+langfuse>=4.0.0,<5.0.0
+python-dotenv>=1.0.0,<2.0.0
 # Browser TLS/JA3 impersonation — bypasses TLS-fingerprint anti-bot (fetch tier
 # between plain HTTP and Playwright). Also used for ATS direct-JSON connect.
 curl_cffi>=0.7.0

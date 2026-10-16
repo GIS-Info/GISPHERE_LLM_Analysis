@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import requests
 
+from .observability import traced
+from .model_telemetry import model_post
+
 from .config import (
     API_BASE_URL,
     GEMINI_BASE_URL,
@@ -92,31 +95,118 @@ class NewAPIClient:
         timeout: Optional[int],
         reasoning_effort: Optional[str] = None,
     ) -> str:
-        """单次 /chat/completions 调用，失败抛异常。"""
+        """调用模型；根据明确的参数兼容错误自动调整并重试。"""
+
+        # 每个客户端记住各模型不接受的可选参数。
+        if not hasattr(self, "_unsupported_params"):
+            self._unsupported_params = {}
+
+        cache_key = (self.api_base_url, model)
+        excluded = self._unsupported_params.setdefault(
+            cache_key, set()
+        )
+
         body: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_output_tokens,
         }
+
         if temperature is not None:
             body["temperature"] = temperature
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        if reasoning_effort:  # None 时不下发，沿用网关默认档
+        if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
 
-        response = requests.post(
-            f"{self.api_base_url}/chat/completions",
-            headers=self.headers,
-            json=body,
-            timeout=timeout or self.timeout,
-        )
-        response.raise_for_status()
-        text = self.extract_chat_text(response.json())
-        if not text or not text.strip():
-            raise RuntimeError("空响应内容")
-        return text.strip()
+        # 保留当前已知的 Claude 兼容处理。
+        if model.lower().startswith("claude-"):
+            for name in (
+                "temperature",
+                "response_format",
+                "reasoning_effort",
+            ):
+                body.pop(name, None)
 
+        for name in excluded:
+            body.pop(name, None)
+
+        # 只允许自动移除这些可选参数。
+        # 不调整 model、messages、max_tokens 等核心字段。
+        adjustable = {
+            "temperature",
+            "response_format",
+            "reasoning_effort",
+        }
+
+        while True:
+            response, text = model_post(
+                name="chat-completion", url=f"{self.api_base_url}/chat/completions",
+                body=body, headers=self.headers, timeout=timeout or self.timeout,
+                extract_text=self.extract_chat_text, model=model, input=messages,
+                parameters={k: v for k, v in body.items() if k not in ("model", "messages")},
+                require_text=True,
+            )
+            if response.ok:
+                return text.strip()
+
+            logger.error(
+                "模型请求失败：model=%s status=%s response=%s",
+                model,
+                response.status_code,
+                response.text[:3000],
+            )
+
+            # 仅处理明确指出参数不支持的 400 错误。
+            try:
+                payload = response.json()
+                error = payload.get("error", {})
+                if not isinstance(error, dict):
+                    error = {}
+            except (ValueError, AttributeError):
+                error = {}
+
+            param = error.get("param")
+            code = error.get("code")
+            message = str(error.get("message", "")).lower()
+
+            explicitly_unsupported = (
+                code in {
+                    "unsupported_parameter",
+                    "unsupported_value",
+                }
+                or (
+                    code is None
+                    and (
+                        "not supported" in message
+                        or "does not support" in message
+                        or "unsupported parameter" in message
+                    )
+                )
+            )
+
+            if (
+                response.status_code == 400
+                and isinstance(param, str)
+                and param in adjustable
+                and param in body
+                and explicitly_unsupported
+            ):
+                body.pop(param)
+                excluded.add(param)
+
+                logger.warning(
+                    "模型 %s 不接受参数 %s，移除后重试；"
+                    "本次运行后续请求将省略该参数",
+                    model,
+                    param,
+                )
+                continue
+
+            # 其他错误交给原来的模型回退机制。
+            response.raise_for_status()
+
+    @traced("model-fallback-chain")
     def _complete_with_chain(
         self,
         messages: List[Dict[str, Any]],
@@ -272,14 +362,15 @@ class NewAPIClient:
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
 
-        response = requests.post(
-            f"{self.api_base_url}/responses",
-            headers=self.headers,
-            json=body,
-            timeout=timeout or self.timeout,
+        response, text = model_post(
+            name="responses-text", url=f"{self.api_base_url}/responses",
+            body=body, headers=self.headers, timeout=timeout or self.timeout,
+            extract_text=self.extract_response_text, model=model,
+            input={"instructions": instructions, "input": prompt},
+            parameters={k: v for k, v in body.items() if k not in ("model", "input", "instructions")},
         )
         response.raise_for_status()
-        return self.extract_response_text(response.json())
+        return text
 
     def create_image_response(
         self,
@@ -307,14 +398,14 @@ class NewAPIClient:
         if temperature is not None:
             body["temperature"] = temperature
 
-        response = requests.post(
-            f"{self.api_base_url}/responses",
-            headers=self.headers,
-            json=body,
-            timeout=timeout or self.timeout,
+        response, result = model_post(
+            name="responses-vision", url=f"{self.api_base_url}/responses",
+            body=body, headers=self.headers, timeout=timeout or self.timeout,
+            extract_text=self.extract_response_text, model=model, input=body["input"],
+            parameters={k: v for k, v in body.items() if k not in ("model", "input")},
         )
         response.raise_for_status()
-        return self.extract_response_text(response.json())
+        return result
 
     def generate_gemini_content(
         self,
@@ -348,14 +439,14 @@ class NewAPIClient:
             },
         }
 
-        response = requests.post(
-            f"{self.gemini_base_url}/models/{model}:generateContent",
-            headers=self.headers,
-            json=body,
-            timeout=timeout or self.timeout,
+        response, result = model_post(
+            name="gemini-content", url=f"{self.gemini_base_url}/models/{model}:generateContent",
+            body=body, headers=self.headers, timeout=timeout or self.timeout,
+            extract_text=self.extract_gemini_text, protocol="gemini", model=model,
+            input=body["contents"], parameters=body["generationConfig"],
         )
         response.raise_for_status()
-        return self.extract_gemini_text(response.json())
+        return result
 
     @staticmethod
     def image_path_to_data_url(image_path: Union[str, Path], media_type: str) -> str:
