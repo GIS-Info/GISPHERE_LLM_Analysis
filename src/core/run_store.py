@@ -22,7 +22,7 @@ def pipeline_version():
     root = Path(__file__).resolve().parent
     sources = ["analysis_stage.py", "llm_agent.py", "result_schema.py", "config.py",
                "contact_verifier.py", "direction_verifier.py", "api_client.py", "utils.py",
-               "model_telemetry.py"]
+               "model_telemetry.py", "final_review.py"]
     hasher = hashlib.sha256()
     for name in sources:
         hasher.update((root / name).read_bytes())
@@ -92,9 +92,27 @@ class RunStore:
         return {stage: entry["result"] for stage, entry in stages.items()
                 if isinstance(entry, dict) and entry.get("success") is True
                 and (stage != "stage1" or entry.get("analysis_date") == date.today().isoformat())
-                and not validation_errors(entry.get("result"), stage)}
+                and not validation_errors(entry.get("result"), stage,
+                    allow_empty_label1=stage == 'stage3')}
 
-    def save_stage(self, source, row_index, url, content, stage, success, result, error):
+    def load_stage_evidence(self, source, row_index, url, content):
+        valid = self.load_stages(source, row_index, url, content)
+        data = self._read(self.checkpoint_path(source, row_index, url))
+        return {stage: data['stages'][stage].get('evidence', []) for stage in valid
+                if isinstance(data['stages'][stage].get('evidence', []), list)}
+
+    def save_review(self, source, row_index, url, report):
+        path = self.root / 'reviews' / (digest(f'{source}\n{row_index}\n{url}') + '.json')
+        return self._write(path, {'source': source, 'row_index': row_index, 'url': url,
+                                  'created_at': time.time(), 'review': report})
+
+    def load_stage_warnings(self, source, row_index, url, content):
+        valid = self.load_stages(source, row_index, url, content)
+        data = self._read(self.checkpoint_path(source, row_index, url))
+        return {stage: data['stages'][stage].get('warnings', []) for stage in valid
+                if isinstance(data['stages'][stage].get('warnings', []), list)}
+
+    def save_stage(self, source, row_index, url, content, stage, success, result, error, evidence=None, warnings=None):
         path = self.checkpoint_path(source, row_index, url)
         data = self._read(path)
         if data.get("version") != self.version or data.get("content_hash") != digest(content):
@@ -103,6 +121,8 @@ class RunStore:
         if not isinstance(data.get("stages"), dict):
             data["stages"] = {}
         data["stages"][stage] = {"success": bool(success), "result": result if success else {},
+                                "evidence": evidence if isinstance(evidence, list) else [],
+                                "warnings": warnings if isinstance(warnings, list) else [],
                                 "error": error, "created_at": time.time(),
                                 "analysis_date": date.today().isoformat()}
         return self._write(path, data)

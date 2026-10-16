@@ -590,6 +590,7 @@ Snapshot 内容：
             Tuple[str, str, str]: (称谓前缀, 邮箱地址, 分析说明)
         """
         logger.info(f"开始分析联系人页面，共 {len(search_results)} 个结果")
+        self.last_review_evidence = []
 
         result_map = {r['url']: r for r in search_results if r.get('url')}
 
@@ -638,7 +639,9 @@ Snapshot 内容：
                             'url': url,
                             'analysis': analysis,
                             'content': page_content[:2000],
-                            'snippet': snippet_text
+                            'snippet': snippet_text,
+                            'review_source': {'kind': 'contact_decision_page', 'url': url,
+                                'title': title_text, 'search_snippet': snippet_text, 'text': page_content}
                         })
             except Exception as e:
                 logger.warning(f"分析页面失败 {url}: {e}")
@@ -655,6 +658,7 @@ Snapshot 内容：
             Dict: 更新后的联系人信息
         """
         logger.info(f"开始验证联系人: {contact_name} @ {university_en}")
+        self.last_review_evidence = []
 
         if not CONTACT_VERIFICATION_ENABLED:
             logger.info("联系人验证功能已禁用")
@@ -719,6 +723,11 @@ Snapshot 内容：
                     result['Contact_Email'] = found_email
 
             result['verification_details'] = explanation
+            adopted = {field for field, old in (('Contact_Name', contact_name), ('Contact_Email', contact_email))
+                       if result[field] != old}
+            # Only pages that support a field actually adopted in the final row.
+            self.last_review_evidence = [dict(item, decision_fields=[f for f in item['decision_fields'] if f in adopted])
+                for item in self.last_review_evidence if adopted.intersection(item['decision_fields'])]
             logger.info(f"验证完成: {result['Contact_Name']}, {result['Contact_Email']}")
 
         except Exception as e:
@@ -1047,6 +1056,7 @@ Important notes:
     def _synthesize_contact_info(self, analyzed_pages: List[Dict],
                                   contact_name: str) -> Tuple[str, str, str]:
         """综合分析结果，确定最终联系人信息"""
+        self.last_review_evidence = []
         if not analyzed_pages:
             return "Mr./Ms.", "", "未找到相关页面信息"
 
@@ -1077,6 +1087,34 @@ Important notes:
                 title_prefix = "Mr./Ms."
 
         best_email = emails[0] if emails else ""
+
+        def remember(page, field):
+            source = page.get('review_source')
+            if not source:
+                return
+            existing = next((e for e in self.last_review_evidence if e['url'] == source['url']), None)
+            if existing is None:
+                existing = dict(source, decision_fields=[])
+                self.last_review_evidence.append(existing)
+            if field not in existing['decision_fields']:
+                existing['decision_fields'].append(field)
+
+        # Email selection above is the first accepted address, so keep precisely
+        # that page, not all fetched or successfully analyzed candidates.
+        if best_email:
+            for page in analyzed_pages:
+                analysis = page.get('analysis') or {}
+                if clean_email_format(analysis.get('email_address') or '') == best_email:
+                    remember(page, 'Contact_Email')
+                    break
+        # Keep a page the page-analysis model accepted as supporting the adopted title.
+        for page in analyzed_pages:
+            analysis = page.get('analysis') or {}
+            supports_title = (title_prefix == 'Dr.' and analysis.get('has_doctorate')) or (
+                title_prefix in ('Mr.', 'Ms.') and analysis.get('gender') == ('male' if title_prefix == 'Mr.' else 'female'))
+            if supports_title:
+                remember(page, 'Contact_Name')
+                break
 
         explanation = f"分析了{len(analyzed_pages)}个页面，"
         explanation += (f"{has_doctorate_count}个页面确认有博士学位。"

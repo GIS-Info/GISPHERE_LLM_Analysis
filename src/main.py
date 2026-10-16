@@ -29,6 +29,8 @@ from .core.analysis_stage import AnalysisStageManager
 from .core.observability import traced, flush_traces
 from .core.run_options import RunOptions, parse_run_options, select_rows, rerun_updates
 from .core.run_store import RunStore
+from .core.final_review import review_final_result, review_error, candidate_fields
+from .core.result_schema import discard_overlong_labels, rejected_primary_label
 
 logger = logging.getLogger(__name__)
 
@@ -255,20 +257,56 @@ class LLMAnalysisSystem:
                 logger.info("没有匹配的成功检查点，将执行全部阶段并保留已有字段")
 
             def save_stage(stage, success, result, error):
-                self.run_store.save_stage(source, row_index, url, content, stage, success, result, error)
+                self.run_store.save_stage(source, row_index, url, content, stage, success, result, error,
+                    evidence=self.analysis_manager.review_evidence.get(stage, []),
+                    warnings=[w for w in self.analysis_manager.field_warnings if w.get('stage') == stage])
 
             has_results, results, error_msg = self.analysis_manager.analyze_text_complete(
-                content, row_index, completed_stages=completed, on_stage_complete=save_stage)
+                content, row_index, completed_stages=completed, on_stage_complete=save_stage,
+                completed_evidence=self.run_store.load_stage_evidence(source, row_index, url, content)
+                    if completed else {},
+                completed_warnings=self.run_store.load_stage_warnings(source, row_index, url, content)
+                    if completed else {})
+            conflicts = []
             if self.options.rerun:
                 summary = self.analysis_manager.last_run_summary
                 results, conflicts = rerun_updates(row_data, results, summary["successful"],
                                                    summary["executed"], self.options.overwrite)
-                if conflicts:
-                    retained = "保留已有字段: " + ", ".join(conflicts)
-                    error_msg = f"{error_msg}; {retained}" if error_msg else retained
+            if 'stage3' in self.analysis_manager.last_run_summary['successful']:
+                # A rerun can retain old values; sanitize the actual merged row too.
+                _, additional = discard_overlong_labels(candidate_fields(row_data, results))
+                for warning in additional:
+                    results[warning['field']] = ''
+                    self.analysis_manager.field_warnings.append(warning)
+                    conflicts = [field for field in conflicts if field != warning['field']]
+            if conflicts:
+                retained = "保留已有字段: " + ", ".join(conflicts)
+                error_msg = f"{error_msg}; {retained}" if error_msg else retained
             
+            # Audit the EXACT merged candidate before granting Verifier=LLM.
+            if has_results and not error_msg:
+                evidence = [item for items in self.analysis_manager.review_evidence.values() for item in items]
+                report = review_final_result(content, candidate_fields(row_data, results),
+                    source_url=url, evidence=evidence, row_index=row_index,
+                    rejected_labels=self.analysis_manager.field_warnings)
+                self.run_store.save_review(source, row_index, url, report)
+                error_msg = review_error(report)
+                logger.info('最终审核: model=%s status=%s', report['model'], report['status'])
+
+            if (has_results and 'stage3' in self.analysis_manager.last_run_summary['successful']
+                    and not candidate_fields(row_data, results)['WX_Label1']
+                    and not rejected_primary_label(self.analysis_manager.field_warnings)):
+                note = 'WX_Label1 为空，待人工补充'
+                if note not in error_msg:
+                    error_msg = '; '.join(filter(None, (error_msg, note)))
+
             # 检查是否为第三方网址
             final_error_msg = error_msg if error_msg else ""
+            warnings = self.analysis_manager.field_warnings
+            if warnings:
+                note = '超长标签已舍弃: ' + '; '.join(
+                    f"{w['field']}={w['value'][:80]}（{w['length']}字）" for w in warnings)
+                final_error_msg = '; '.join(filter(None, (final_error_msg, note[:1400])))
             if not used_notes:
                 from .core.utils import is_third_party_url
                 if is_third_party_url(url):

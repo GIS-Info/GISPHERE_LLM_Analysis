@@ -170,6 +170,14 @@ TEXT_MODEL_CHAIN = [
     "deepseek-v4-pro",
     "model-router",
 ]
+# Final review is independent of the extraction fallback chain.
+FINAL_REVIEW_MODEL = os.getenv("FINAL_REVIEW_MODEL", "claude-opus-5-5").strip()
+FINAL_REVIEW_TIMEOUT = int(os.getenv("FINAL_REVIEW_TIMEOUT", "120"))
+FINAL_REVIEW_MAX_TOKENS = int(os.getenv("FINAL_REVIEW_MAX_TOKENS", "8192"))
+FINAL_REVIEW_MAX_CHARS = int(os.getenv("FINAL_REVIEW_MAX_CHARS", "200000"))
+if (not FINAL_REVIEW_MODEL or FINAL_REVIEW_TIMEOUT <= 0
+        or not 1 <= FINAL_REVIEW_MAX_TOKENS <= 32768 or FINAL_REVIEW_MAX_CHARS <= 0):
+    raise ValueError("Invalid final review model, timeout or input/output budget")
 # 图片/文档（VLM）使用：仅含支持视觉输入的模型，按能力最强→最弱排序。
 # deepseek-v4-pro / model-router 非多模态，故视觉链只保留 gpt-5.6 系列。
 VISION_MODEL_CHAIN = [

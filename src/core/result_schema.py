@@ -21,7 +21,30 @@ def valid_deadline(value):
         return False
 
 
-def validation_errors(result, stage, *, require_geo=True):
+def discard_overlong_labels(result):
+    """Reject only the offending value; never truncate or discard other fields."""
+    if not isinstance(result, dict):
+        return result, []
+    cleaned, warnings = dict(result), []
+    for field in ('WX_Label1', 'WX_Label2', 'WX_Label3', 'WX_Label4', 'WX_Label5'):
+        value = cleaned.get(field)
+        if isinstance(value, str) and len(value) > 6:
+            cleaned[field] = ''
+            warnings.append({'stage': 'stage3', 'field': field, 'value': value,
+                             'reason': 'overlong_label', 'length': len(value)})
+    return cleaned, warnings
+
+
+def rejected_primary_label(warnings):
+    if not isinstance(warnings, list):
+        return False
+    return any(isinstance(item, dict) and item.get('field') == 'WX_Label1'
+               and item.get('reason') == 'overlong_label'
+               and isinstance(item.get('value'), str) and len(item['value']) > 6
+               for item in (warnings or []))
+
+
+def validation_errors(result, stage, *, require_geo=True, allow_empty_label1=False):
     if stage not in STAGE_FIELDS:
         return [f"未知阶段: {stage}"]
     if not isinstance(result, dict):
@@ -58,10 +81,14 @@ def validation_errors(result, stage, *, require_geo=True):
                 errors.append(f"{field} 必须为空或中文名称（不含英文、数字和符号）")
         for field in ("WX_Label1", "WX_Label2", "WX_Label3"):
             value = result[field]
-            if (field == "WX_Label1" and not value) or (value and (
-                len(value) > 6 or not HAN.fullmatch(value) or value in FORBIDDEN_LABELS
-            )):
-                errors.append(f"{field} 必须是合规的中文标签，最多六字，Label1 必填")
+            if field == 'WX_Label1' and not value and not allow_empty_label1:
+                errors.append('WX_Label1 为空，必须填写至少一个专业标签')
+            if len(value) > 6:
+                errors.append(f'{field} 为 {len(value)} 字，超过六字上限')
+            if value and not HAN.fullmatch(value):
+                errors.append(f'{field} 必须仅含汉字')
+            if value in FORBIDDEN_LABELS:
+                errors.append(f'{field} 使用了不允许的通用分类标签: {value}')
         if result["WX_Label4"] or result["WX_Label5"]:
             errors.append("WX_Label4 和 WX_Label5 必须留空")
     return errors

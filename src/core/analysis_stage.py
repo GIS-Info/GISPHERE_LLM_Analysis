@@ -6,7 +6,8 @@ import logging
 from typing import Dict, Optional, Tuple
 from .llm_agent import LLMAgent
 from .observability import traced
-from .result_schema import validation_errors, valid_deadline, STAGE_FIELDS
+from .result_schema import (validation_errors, valid_deadline, STAGE_FIELDS,
+                            discard_overlong_labels)
 from ..ingestion.excel_handler import validate_analysis_result
 from .contact_verifier import ContactVerifier
 from .direction_verifier import DirectionVerifier
@@ -51,32 +52,45 @@ class AnalysisStageManager:
         
     @traced("three-stage-analysis")
     def analyze_text_complete(self, text: str, row_index: int, *,
-                              completed_stages=None, on_stage_complete=None) -> Tuple[bool, Dict, str]:
+                              completed_stages=None, on_stage_complete=None,
+                              completed_evidence=None, completed_warnings=None) -> Tuple[bool, Dict, str]:
         """Run three stages; reuse only validated checkpoints supplied by the caller."""
         self.current_row_index = row_index
         self.llm_agent.conversation_saved = False
         summary = {"executed": [], "reused": [], "successful": [], "failed": {}}
         self.last_run_summary = summary
+        self.review_evidence = {}
+        self.field_warnings = []
+        summary['warnings'] = self.field_warnings
         final_result = {}
         cached = completed_stages or {}
         try:
             for stage, execute in (("stage1", self._execute_stage1),
                                    ("stage2", self._execute_stage2),
                                    ("stage3", self._execute_stage3)):
-                if stage in cached and not validation_errors(cached[stage], stage):
+                cached_warnings = (completed_warnings or {}).get(stage, [])
+                if stage in cached and not validation_errors(cached[stage], stage,
+                        allow_empty_label1=stage == 'stage3'):
                     success, result, error = True, dict(cached[stage]), ""
                     summary["reused"].append(stage)
+                    self.review_evidence[stage] = (completed_evidence or {}).get(stage, [])
+                    self.field_warnings.extend(cached_warnings)
                     logger.info("行 %s 复用 %s 成功检查点", row_index, stage)
                 else:
                     summary["executed"].append(stage)
                     try:
                         success, result, error = execute(text)
                         if success:
-                            errors = validation_errors(result, stage)
+                            errors = validation_errors(result, stage,
+                                allow_empty_label1=stage == 'stage3')
                             if errors:
                                 success, error = False, "; ".join(errors)
                     except Exception as exc:
                         success, result, error = False, {}, str(exc)
+                    verifier = {"stage1": self.contact_verifier,
+                                "stage2": self.direction_verifier}.get(stage)
+                    evidence = getattr(verifier, 'last_review_evidence', [])
+                    self.review_evidence[stage] = evidence if isinstance(evidence, list) else []
                     if on_stage_complete is not None:
                         try:
                             on_stage_complete(stage, success, result, error)
@@ -105,6 +119,8 @@ class AnalysisStageManager:
     def _execute_stage1(self, text: str) -> Tuple[bool, Dict, str]:
         """执行阶段1分析（包含联系人验证）"""
         logger.info("执行英文分析阶段1（含联系人验证）")
+        if self.contact_verifier is not None:
+            self.contact_verifier.last_review_evidence = []
         
         try:
             # 重置上下文
@@ -232,6 +248,8 @@ class AnalysisStageManager:
     def _execute_stage2(self, text: str) -> Tuple[bool, Dict, str]:
         """执行阶段2分析"""
         logger.info("执行英文分析阶段2")
+        if self.direction_verifier is not None:
+            self.direction_verifier.last_review_evidence = []
         
         try:
             # 重置上下文
@@ -293,16 +311,22 @@ class AnalysisStageManager:
             if not result:
                 return False, {}, "LLM返回空结果"
             
-            # 验证结果格式
-            errors = validation_errors(result, "stage3")
+            # Keep every other field when rejecting an overlong label value.
+            result, warnings = discard_overlong_labels(result)
+            if not hasattr(self, 'field_warnings'):
+                self.field_warnings = []
+            self.field_warnings.extend(warnings)
+            for warning in warnings:
+                logger.warning('%s 超过六字，仅舍弃该标签: %s', warning['field'], warning['value'])
+            # Missing Label1 is a manual-review finding, not a reason to lose
+            # University_CN/Country_CN and the other extracted labels.
+            errors = validation_errors(result, "stage3", allow_empty_label1=True)
             if errors:
                 return False, {}, "; ".join(errors)
             
-            # WX_Label1必须有内容
-            if not result.get('WX_Label1') or result['WX_Label1'].strip() == "":
-                return False, {}, "WX_Label1为空，必须填写至少一个专业标签"
-            
-            logger.info("阶段3分析成功")
+            if not result['WX_Label1'] and not warnings:
+                logger.warning('WX_Label1 为空，保留阶段三其他字段，交给审核及人工补充')
+            logger.info("阶段3提取完成，结果将进入审核")
             return True, result, ""
             
         except Exception as e:

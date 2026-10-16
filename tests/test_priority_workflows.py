@@ -12,7 +12,8 @@ import pandas as pd
 
 from src.core import observability as tracing
 from src.core.analysis_stage import AnalysisStageManager
-from src.core.result_schema import STAGE_FIELDS, validation_errors, valid_deadline
+from src.core.result_schema import (STAGE_FIELDS, validation_errors, valid_deadline,
+                                    discard_overlong_labels, rejected_primary_label)
 from src.core.run_options import RunOptions, parse_rows, parse_run_options, rerun_updates, select_rows
 from src.core.run_store import RunStore
 from src.ingestion.excel_handler import ExcelHandler, validate_analysis_result
@@ -87,8 +88,40 @@ class ValidationTests(OfflineTests):
         instance = manager()
         instance.llm_agent.analyze_text_stage1.return_value = dict(GOLD["stage1"], Deadline="2026-99-99")
         self.assertFalse(instance._execute_stage1("offline")[0])
-        instance.llm_agent.analyze_text_stage3.return_value = dict(GOLD["stage3"], WX_Label1="English")
+        instance.llm_agent.analyze_text_stage3.return_value = dict(GOLD["stage3"], WX_Label1="Eng")
         self.assertFalse(instance._execute_stage3("offline")[0])
+
+    def test_overlong_labels_only_clear_the_offending_values(self):
+        raw = dict(GOLD['stage3'], WX_Label1='生成式人工智能', WX_Label2='空间数据基础设施', WX_Label3='深度强化学习')
+        cleaned, warnings = discard_overlong_labels(raw)
+        self.assertEqual(cleaned['WX_Label1'], '')
+        self.assertEqual(cleaned['WX_Label2'], '')
+        self.assertEqual(cleaned['WX_Label3'], '深度强化学习')
+        self.assertEqual(cleaned['University_CN'], raw['University_CN'])
+        self.assertEqual(raw['WX_Label1'], '生成式人工智能')
+        self.assertEqual(len(warnings), 2)
+        self.assertFalse(validation_errors(cleaned, 'stage3', allow_empty_label1=rejected_primary_label(warnings)))
+
+    def test_discarded_primary_does_not_fail_real_stage_or_orchestration(self):
+        instance = manager()
+        instance.llm_agent.analyze_text_stage3.return_value = dict(GOLD['stage3'], WX_Label1='生成式人工智能')
+        success, result, error = instance.analyze_text_complete('offline', 0)
+        self.assertTrue(success)
+        self.assertEqual(error, '')
+        self.assertEqual(result['WX_Label1'], '')
+        self.assertEqual(result['University_CN'], GOLD['stage3']['University_CN'])
+        self.assertIn('stage3', instance.last_run_summary['successful'])
+        self.assertEqual(instance.field_warnings[0]['value'], '生成式人工智能')
+
+    def test_empty_primary_preserves_extracted_fields_for_manual_review(self):
+        instance = manager()
+        for raw in (dict(GOLD['stage3'], WX_Label1=''), {k: '' for k in STAGE_FIELDS['stage3']}):
+            instance.llm_agent.analyze_text_stage3.return_value = raw
+            success, result, error = instance._execute_stage3('offline')
+            self.assertTrue(success)
+            self.assertEqual(result, raw)
+            self.assertEqual(error, '')
+        self.assertFalse(rejected_primary_label([{'field': 'WX_Label1', 'value': '短', 'reason': 'overlong_label'}]))
 
     def test_resume_calls_only_failed_stage(self):
         instance = manager()
@@ -185,6 +218,20 @@ class StoreTests(unittest.TestCase):
         path.write_text("{broken", encoding="utf-8")
         self.assertIsNone(self.store.get_content("source", "url"))
 
+    def test_discarded_label_checkpoint_requires_and_restores_rejection_record(self):
+        result, warnings = discard_overlong_labels(dict(GOLD['stage3'], WX_Label1='生成式人工智能'))
+        self.store.save_stage('source', 0, 'url', 'body', 'stage3', True, result, '', warnings=warnings)
+        self.assertEqual(self.store.load_stages('source', 0, 'url', 'body')['stage3']['WX_Label1'], '')
+        restored = self.store.load_stage_warnings('source', 0, 'url', 'body')
+        self.assertEqual(restored['stage3'], warnings)
+        instance = manager()
+        with patch.object(tracing, 'get_tracing_client', return_value=None):
+            instance.analyze_text_complete('body', 0, completed_stages={'stage3': result}, completed_warnings=restored)
+        instance.llm_agent.analyze_text_stage3.assert_not_called()
+        self.assertEqual(instance.field_warnings, warnings)
+        self.store.save_stage('source', 0, 'url', 'body', 'stage3', True, result, '')
+        self.assertIn('stage3', self.store.load_stages('source', 0, 'url', 'body'))
+
     def test_stage_cache_matches_content_version_row_and_source(self):
         self.store.save_stage("source", 0, "url", "body", "stage1", True, GOLD["stage1"], "")
         self.assertIn("stage1", self.store.load_stages("source", 0, "url", "body"))
@@ -207,6 +254,10 @@ class StoreTests(unittest.TestCase):
 class WorkflowTests(OfflineTests):
     def setUp(self):
         super().setUp()
+        reviewer = patch('src.main.review_final_result', return_value={
+            'status': 'passed', 'model': 'offline-review', 'summary': 'offline passed'})
+        self.review = reviewer.start()
+        self.addCleanup(reviewer.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.system = LLMAnalysisSystem.__new__(LLMAnalysisSystem)
@@ -272,6 +323,74 @@ class WorkflowTests(OfflineTests):
         self.assertTrue(handler.set_row_status(0, "", ""))
         self.assertEqual(google_frame.loc[0, "Error"], "")
         self.assertEqual(google_frame.loc[0, "Verifier"], "")
+
+    def test_final_review_issue_preserves_fields_but_blocks_verifier(self):
+        self.review.return_value = {'status': 'needs_review', 'model': 'offline-review',
+            'checks': [{'field': 'Contact_Email', 'status': 'uncertain', 'reason': '缺少联系人页面依据'}]}
+        self.assertTrue(self.system._process_single_row(0))
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'Verifier'], '')
+        self.assertIn('审核需检查', self.system.excel_handler.df.loc[0, 'Error'])
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'University_EN'], GOLD['stage1']['University_EN'])
+        self.review.assert_called_once()
+
+    def test_incomplete_review_on_full_rerun_clears_old_llm_status(self):
+        self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True)
+        self.system.excel_handler.df.loc[0, 'Verifier'] = 'LLM'
+        self.review.return_value = {'status': 'incomplete', 'model': 'offline-review', 'summary': '审核未完成: timeout'}
+        self.assertTrue(self.system._process_single_row(0))
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'Verifier'], '')
+        self.assertIn('审核未完成', self.system.excel_handler.df.loc[0, 'Error'])
+
+    def test_partial_extraction_skips_final_review(self):
+        self.system.analysis_manager.llm_agent.analyze_text_stage2.return_value = None
+        self.assertTrue(self.system._process_single_row(0))
+        self.review.assert_not_called()
+
+    def test_rejected_labels_still_reach_review_and_preserve_other_fields(self):
+        self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True)
+        self.system.analysis_manager.llm_agent.analyze_text_stage3.return_value = dict(
+            GOLD['stage3'], WX_Label1='生成式人工智能', WX_Label2='空间数据基础设施')
+        self.assertTrue(self.system._process_single_row(0))
+        row = self.system.excel_handler.df.loc[0]
+        self.assertEqual(row['WX_Label1'], '')
+        self.assertEqual(row['WX_Label2'], '')
+        self.assertEqual(row['University_CN'], GOLD['stage3']['University_CN'])
+        self.assertEqual(row['Verifier'], 'LLM')
+        self.assertIn('超长标签已舍弃', row['Error'])
+        self.review.assert_called_once()
+        self.assertEqual(self.review.call_args.args[1]['WX_Label1'], '')
+        self.assertEqual(len(self.review.call_args.kwargs['rejected_labels']), 2)
+
+    def test_preserved_old_overlong_value_is_also_removed_before_review(self):
+        self.system.excel_handler.df.loc[0, 'WX_Label2'] = '生成式人工智能'
+        self.assertTrue(self.system._process_single_row(0))
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'WX_Label2'], '')
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'Verifier'], 'LLM')
+        self.review.assert_called_once()
+
+    def test_rejected_label_does_not_override_review_failure(self):
+        self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True)
+        self.system.analysis_manager.llm_agent.analyze_text_stage3.return_value = dict(
+            GOLD['stage3'], WX_Label2='生成式人工智能')
+        self.review.return_value = {'model': 'offline-review', 'status': 'incomplete', 'summary': '审核未完成'}
+        self.assertTrue(self.system._process_single_row(0))
+        row = self.system.excel_handler.df.loc[0]
+        self.assertEqual(row['Verifier'], '')
+        self.assertEqual(row['WX_Label2'], '')
+        self.assertIn('超长标签已舍弃', row['Error'])
+        self.assertIn('审核未完成', row['Error'])
+
+    def test_missing_primary_saves_all_other_results_and_requests_manual_completion(self):
+        self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True)
+        self.system.analysis_manager.llm_agent.analyze_text_stage3.return_value = dict(GOLD['stage3'], WX_Label1='')
+        self.assertTrue(self.system._process_single_row(0))
+        row = self.system.excel_handler.df.loc[0]
+        self.assertEqual(row['University_EN'], GOLD['stage1']['University_EN'])
+        self.assertEqual(row['University_CN'], GOLD['stage3']['University_CN'])
+        self.assertEqual(row['WX_Label2'], GOLD['stage3']['WX_Label2'])
+        self.assertEqual(row['Verifier'], '')
+        self.assertIn('WX_Label1 为空，待人工补充', row['Error'])
+        self.review.assert_called_once()
 
     def test_failed_full_rerun_clears_stale_verifier_and_preserves_existing_results(self):
         self.system.options = RunOptions(rows=(2,), rerun="all")

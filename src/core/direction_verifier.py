@@ -158,6 +158,7 @@ Expected JSON Format (Example if unrelated):
             Dict: 映射成功的地理方向（如 {'GIS': '1'}），如果验证失败认为不属于GIS，则返回 None
         """
         logger.info("进入方向二次验证流程（因为常规判定未能选出任何方向）")
+        self.last_review_evidence = []
         
         # 步骤A: 提取实际方向
         actual_directions = self._extract_actual_directions(text)
@@ -180,6 +181,8 @@ Expected JSON Format (Example if unrelated):
                 logger.info("辅助验证搜索未能返回有效内容，将仅依赖大模型本地知识验证")
                 
         # 步骤C: 综合研判
+        if search_context:
+            self.last_review_evidence.append({'kind': 'direction_search', 'text': search_context})
         mapped_fields = self._evaluate_directions(text, actual_directions, search_context)
         
         if mapped_fields:
