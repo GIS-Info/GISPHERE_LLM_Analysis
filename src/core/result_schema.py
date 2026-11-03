@@ -22,7 +22,7 @@ def valid_deadline(value):
 
 
 def discard_overlong_labels(result):
-    """Reject only the offending value; never truncate or discard other fields."""
+    """Reject overlong labels and move remaining labels forward in order."""
     if not isinstance(result, dict):
         return result, []
     cleaned, warnings = dict(result), []
@@ -32,6 +32,13 @@ def discard_overlong_labels(result):
             cleaned[field] = ''
             warnings.append({'stage': 'stage3', 'field': field, 'value': value,
                              'reason': 'overlong_label', 'length': len(value)})
+    fields = ('WX_Label1', 'WX_Label2', 'WX_Label3')
+    if warnings and all(isinstance(cleaned.get(field), str) for field in fields):
+        # Reserved Label4/5 never become active labels. Invalid/missing fields
+        # remain available to validation instead of being silently repaired.
+        labels = [cleaned[field] for field in fields if cleaned[field]]
+        for index, field in enumerate(fields):
+            cleaned[field] = labels[index] if index < len(labels) else ''
     return cleaned, warnings
 
 

@@ -58,6 +58,11 @@ SCROLL_BUFFER = 1000  # 页面底部缓冲像素数
 USE_PLAYWRIGHT = True  # 是否使用Playwright（通过独立进程，无异步冲突）
 PLAYWRIGHT_TIMEOUT = 120  # Playwright页面加载超时时间（秒）- 增加到120秒
 PLAYWRIGHT_SCROLL_ENABLED = True  # 是否启用滚动加载
+# 三阶段共享完整页面证据；可临时关闭以比较正文抽取结果。
+STAGE_FULL_PAGE_ENABLED = os.getenv("STAGE_FULL_PAGE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+STAGE_FULL_PAGE_MAX_CHARS = int(os.getenv("STAGE_FULL_PAGE_MAX_CHARS", "200000"))
+if STAGE_FULL_PAGE_MAX_CHARS <= 0:
+    raise ValueError("STAGE_FULL_PAGE_MAX_CHARS must be positive")
 # 默认有头（headless=False），最大程度避免触发反爬检测；服务器环境可设环境变量覆盖
 PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "0").lower() in ("1", "true", "yes", "on")
 

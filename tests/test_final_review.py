@@ -18,7 +18,7 @@ from src.core.result_schema import discard_overlong_labels
 
 CASE = json.loads((Path(__file__).parent / 'fixtures/evaluation_cases.json').read_text(encoding='utf-8'))['cases'][0]
 VALUES = {k: v for result in CASE['expected'].values() for k, v in result.items()}
-SOURCE = 'Verbatim supporting evidence from an offline source.'
+SOURCE = CASE['text']
 
 
 def report():
@@ -64,6 +64,39 @@ class FinalReviewTests(unittest.TestCase):
             self.assertIn('Deadline', review_error(result))
             self.assertEqual(before, VALUES)
 
+    def test_missing_honorific_requires_lookup_even_if_model_approves_name(self):
+        values = dict(VALUES, Contact_Name='Mukund Gupta', Contact_Email='Mukund.Gupta@tudelft.nl')
+        before = copy.deepcopy(values)
+        with patch('src.core.final_review.model_post', return_value=(self.response, json.dumps(report()))):
+            result = review_final_result(SOURCE, values, client=self.client)
+        self.assertEqual(result['status'], 'needs_review')
+        check = next(c for c in result['checks'] if c['field'] == 'Contact_Name')
+        self.assertEqual(check['status'], 'uncertain')
+        self.assertIn('官方个人页', review_error(result))
+        self.assertIn('补全', review_error(result))
+        self.assertEqual(values, before)
+
+    def test_honorific_reminder_preserves_existing_name_issue_and_quote(self):
+        data = report()
+        data['verdict'] = 'needs_review'
+        check = next(c for c in data['checks'] if c['field'] == 'Contact_Name')
+        check.update(status='issue', reason='页面显示博士学位但姓名缺少 Dr.')
+        with patch('src.core.final_review.model_post', return_value=(self.response, json.dumps(data))):
+            result = review_final_result(SOURCE, dict(VALUES, Contact_Name='Mukund Gupta'), client=self.client)
+        check = next(c for c in result['checks'] if c['field'] == 'Contact_Name')
+        self.assertEqual(check['status'], 'issue')
+        self.assertEqual(check['evidence'], SOURCE)
+        self.assertIn('博士学位', check['reason'])
+
+    def test_supported_prefixes_and_missing_contact_do_not_trigger_title_reminder(self):
+        for name in ('Dr. Mukund Gupta', 'Mr. Jane Example', 'Ms. Jane Example', '-'):
+            data = report()
+            next(c for c in data['checks'] if c['field'] == 'Contact_Name')['evidence'] = name if name != '-' else ''
+            with self.subTest(name=name), patch('src.core.final_review.model_post',
+                    return_value=(self.response, json.dumps(data))):
+                result = review_final_result(SOURCE + '\n' + name, dict(VALUES, Contact_Name=name), client=self.client)
+            self.assertEqual(result['status'], 'passed')
+
     def test_missing_duplicate_unknown_checks_and_conflicting_verdict_are_rejected(self):
         for mode in ('missing', 'duplicate', 'unknown', 'contradiction'):
             data = report()
@@ -100,7 +133,8 @@ class FinalReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'passed')
         post.assert_called_once()
         payload = json.loads(post.call_args.kwargs['body']['messages'][1]['content'])
-        self.assertEqual(payload['fields']['WX_Label1'], '')
+        self.assertEqual(payload['fields']['WX_Label1'], VALUES['WX_Label2'])
+        self.assertNotIn('生成式人工智能', payload['fields'].values())
         self.assertEqual(payload['rejected_labels'], rejected)
         self.assertEqual(result['rejected_labels'], rejected)
 
@@ -183,8 +217,45 @@ class ProvenanceTests(unittest.TestCase):
         return instance
 
     def page(self, url, degree=False, email='', gender='unknown'):
-        return {'url': url, 'analysis': {'has_doctorate': degree, 'email_address': email, 'gender': gender},
-                'review_source': {'url': url, 'text': 'Exact snapshot ' + url}}
+        text = 'Jane Doe, also listed as Jane Example, PhD.' if degree else 'Jane Doe, also listed as Jane Example.'
+        return {'url': url, 'analysis': {'has_doctorate': True if degree else None,
+                'email_address': email, 'gender': gender, 'confidence': 'high', 'evidence': text},
+                'review_source': {'url': url, 'text': text}}
+
+    def test_gender_alone_never_supplies_an_honorific(self):
+        instance = self.verifier()
+        for gender in ('male', 'female', 'unknown'):
+            with self.subTest(gender=gender):
+                prefix, _, _ = instance._synthesize_contact_info(
+                    [self.page('profile', gender=gender)], 'Jane Example')
+                self.assertEqual(prefix, '')
+                self.assertEqual(instance.last_review_evidence, [])
+
+    def test_explicit_honorific_keeps_its_supporting_page(self):
+        instance = self.verifier()
+        page = self.page('official-profile', gender='unknown')
+        page['analysis']['title_prefix'] = 'Ms.'
+        page['analysis']['evidence'] = page['review_source']['text'] = 'Ms. Jane Example'
+        prefix, _, _ = instance._synthesize_contact_info([page], 'Jane Example')
+        self.assertEqual(prefix, 'Ms.')
+        self.assertEqual(instance.last_review_evidence[0]['decision_fields'], ['Contact_Name'])
+
+    def test_verified_doctorate_completes_bare_name_and_retains_evidence(self):
+        instance = self.verifier()
+        instance.mcp_client = object()
+        instance.search_contact_info = MagicMock(return_value=[{'url': 'official-profile'}])
+        page = self.page('official-profile', degree=True)
+        page['review_source']['text'] = 'Mukund Gupta, Assistant Professor, Ph.D. TU Delft'
+        page['analysis']['evidence'] = page['review_source']['text']
+        instance.analyze_contact_pages = lambda *_: instance._synthesize_contact_info([page], 'Mukund Gupta')
+        with patch('src.core.contact_verifier.CONTACT_VERIFICATION_ENABLED', True):
+            result = instance.verify_and_update_contact(
+                'Delft University of Technology', 'Mukund Gupta', 'Mukund.Gupta@tudelft.nl',
+                'Contact Mukund Gupta, Mukund.Gupta@tudelft.nl')
+        self.assertEqual(result['Contact_Name'], 'Dr. Mukund Gupta')
+        self.assertEqual(result['Contact_Email'], 'Mukund.Gupta@tudelft.nl')
+        self.assertEqual(instance.last_review_evidence[0]['url'], 'official-profile')
+        self.assertEqual(instance.last_review_evidence[0]['decision_fields'], ['Contact_Name'])
 
     def test_only_adopted_email_page_and_supporting_title_page_survive(self):
         instance = self.verifier()
@@ -225,7 +296,7 @@ class ProvenanceTests(unittest.TestCase):
             return 'Dr.', 'other@example.invalid', 'offline'
         instance.analyze_contact_pages = analyze
         with patch('src.core.contact_verifier.CONTACT_VERIFICATION_ENABLED', True):
-            result = instance.verify_and_update_contact('Example University', 'Dr. Jane Doe', 'jane@example.invalid', 'offline source')
+            result = instance.verify_and_update_contact('Example University', 'Dr. Jane Doe', 'jane@example.invalid', 'Professor Jane Doe, jane@example.invalid')
         self.assertEqual(result['Contact_Email'], 'jane@example.invalid')
         self.assertEqual(instance.last_review_evidence, [])
 

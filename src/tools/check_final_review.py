@@ -28,7 +28,8 @@ def main():
         ):
             if selected not in ('all', name):
                 continue
-            result = review_final_result(source, values, source_url='https://example.invalid/job', evidence=evidence)
+            result = review_final_result(source, values, source_url='https://example.invalid/job', evidence=evidence,
+                original_page={'status': 'not_applicable', 'reason': 'Synthetic offline fixture'})
             reports.append({'case': name, 'report': result})
             print(f"{name}: {result['status']} ({result['model']})", flush=True)
             if result['status'] != 'passed':

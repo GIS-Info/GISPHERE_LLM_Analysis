@@ -99,6 +99,7 @@ class ContentFetcher:
         """重置最近一次抓取摘要。"""
         self._last_http_challenge = False  # HTTP 层是否检测到反爬验证（Cloudflare 等）
         self._last_http_html = ""          # HTTP 层原始 HTML，供已知 ATS 识别
+        self._last_browser_payload = None
         self.last_fetch_summary = {
             "url": url,
             "content_type": None,
@@ -221,7 +222,8 @@ class ContentFetcher:
                     return content
                 else:
                     logger.info(f"根据Content-Type判断为网页: {content_type}")
-                    return self._fetch_web_content_with_strategy(url)
+                    content = self._fetch_web_content_with_strategy(url)
+                    return self._enrich_stage_content(url, content)
         except Exception as e:
             logger.error(f"获取内容失败: {e}")
             # 异常情况下也尝试截图OCR
@@ -240,6 +242,26 @@ class ContentFetcher:
                     return screenshot_content
             self._finalize_fetch_summary(None, "exception", None, None, str(e))
             return None
+
+    def _enrich_stage_content(self, url: str, content: Optional[str]) -> Optional[str]:
+        from ..core.config import STAGE_FULL_PAGE_ENABLED, STAGE_FULL_PAGE_MAX_CHARS
+        # Canvas PDF viewers and detected PDF downloads retain their document path.
+        if (not content or not STAGE_FULL_PAGE_ENABLED or self._is_canvas_pdf_viewer(url)
+                or self.last_fetch_summary.get('selected_method') == 'pdf'):
+            return content
+        try:
+            from .stage_source import enrich_stage_source
+            enriched, details = enrich_stage_source(
+                content, url, manager=self.playwright_manager,
+                payload=self._last_browser_payload, http_html=self._last_http_html,
+                max_chars=STAGE_FULL_PAGE_MAX_CHARS)
+            self.last_fetch_summary['stage_source'] = details
+            logger.info('三阶段完整页面证据: %s', details)
+            return enriched
+        except Exception as exc:
+            self.last_fetch_summary['stage_source'] = {'status': 'failed', 'reason': str(exc)[:500]}
+            logger.warning('三阶段完整页面证据获取失败，保留原正文: %s', exc)
+            return content
 
     def _get_web_fetch_strategy(self, url: str) -> List[str]:
         """
@@ -715,6 +737,7 @@ class ContentFetcher:
                 logger.warning("Playwright未返回任何内容")
                 return None
 
+            self._last_browser_payload = payload
             html = payload.get('html')
             inner_text = payload.get('inner_text')
             worker_text = payload.get('content')

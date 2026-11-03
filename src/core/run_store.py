@@ -8,14 +8,20 @@ import time
 from datetime import date
 from pathlib import Path
 
-from .config import CACHE_DIR, TEXT_MODEL_CHAIN, TEXT_REASONING_EFFORT, ENABLE_WEB_SEARCH
+from .config import (CACHE_DIR, TEXT_MODEL_CHAIN, TEXT_REASONING_EFFORT, ENABLE_WEB_SEARCH,
+                     STAGE_FULL_PAGE_ENABLED, STAGE_FULL_PAGE_MAX_CHARS)
 from .result_schema import validation_errors
+from ..ingestion.stage_source import CONTENT_VERSION
 
 logger = logging.getLogger(__name__)
 
 
 def digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def content_version():
+    return f'{CONTENT_VERSION}:document-metadata-v1:{STAGE_FULL_PAGE_ENABLED}:{STAGE_FULL_PAGE_MAX_CHARS}'
 
 
 def pipeline_version():
@@ -26,7 +32,10 @@ def pipeline_version():
     hasher = hashlib.sha256()
     for name in sources:
         hasher.update((root / name).read_bytes())
+    for name in ('fetch_text.py', 'content_extractor.py', 'review_source.py', 'stage_source.py'):
+        hasher.update((root.parent / 'ingestion' / name).read_bytes())
     hasher.update(json.dumps([TEXT_MODEL_CHAIN, TEXT_REASONING_EFFORT, ENABLE_WEB_SEARCH]).encode())
+    hasher.update(content_version().encode())
     return hasher.hexdigest()
 
 
@@ -65,18 +74,24 @@ class RunStore:
     def body_path(self, source, url):
         return self.root / "content" / (digest(source + "\n" + url) + ".json")
 
-    def get_content(self, source, url, max_age=7 * 86400):
+    def get_content(self, source, url, max_age=7 * 86400, *, with_metadata=False):
         data = self._read(self.body_path(source, url))
         content, created = data.get("content"), data.get("created_at")
-        if (data.get("source") != source or data.get("url") != url
+        if (data.get("content_version") != content_version()
+                or data.get("source") != source or data.get("url") != url
                 or not isinstance(created, (int, float)) or not 0 <= time.time() - created <= max_age
-                or not isinstance(content, str) or not content.strip()):
+                or not isinstance(content, str) or not content.strip()
+                or type(data.get('is_document')) is not bool):
             return None
-        return content
+        return {'content': content, 'is_document': data['is_document']} if with_metadata else content
 
-    def save_content(self, source, url, content):
+    def save_content(self, source, url, content, *, is_document=False):
+        if type(is_document) is not bool:
+            raise ValueError('is_document must be a boolean')
         return self._write(self.body_path(source, url),
-                           {"source": source, "url": url, "content": content, "created_at": time.time()})
+                           {"source": source, "url": url, "content": content, "created_at": time.time(),
+                            "is_document": is_document,
+                            "content_version": content_version()})
 
     def checkpoint_path(self, source, row_index, url):
         return self.root / "stages" / (digest(f"{source}\n{row_index}\n{url}") + ".json")

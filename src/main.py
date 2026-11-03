@@ -139,7 +139,11 @@ class LLMAnalysisSystem:
                 for row_index in pbar:
                     pbar.set_description(f"处理第 {row_index} 行")
                     
-                    success = self._process_single_row(row_index)
+                    success, saved = self._process_and_save_row(row_index, rows_by_index[row_index])
+                    if not saved:
+                        logger.error('重新加载并重跑后仍无法保存，停止处理，需检查网络或持续的编辑冲突')
+                        self._cleanup_resources()
+                        return False
                     
                     if success:
                         self.success_count += 1
@@ -150,12 +154,7 @@ class LLMAnalysisSystem:
                     
                     self.processed_count += 1
                     
-                    # 立即保存每行的处理结果
-                    self.excel_handler.save_data()
                     logger.info(f"已保存第 {row_index} 行的处理结果")
-            
-            # 最终保存
-            self.excel_handler.save_data()
             
             # 显示最终统计
             self._print_final_statistics()
@@ -170,14 +169,60 @@ class LLMAnalysisSystem:
             
         except KeyboardInterrupt:
             logger.warning("用户中断处理")
-            self.excel_handler.save_data()
-            logger.info("已保存当前进度")
+            if self.excel_handler.save_data():
+                logger.info("已保存当前进度")
+            else:
+                logger.error('当前进度保存失败，未声称保存成功')
             return False
         except Exception as e:
             logger.error(f"处理过程发生异常: {e}")
-            self.excel_handler.save_data()
             self._cleanup_resources()
             return False
+
+    @staticmethod
+    def _row_identity(row):
+        return tuple(str(row.get(field) or '').strip() for field in ('Source', 'Notes'))
+
+    def _process_and_save_row(self, row_index, original_row, *, max_attempts=3):
+        """On save failure, reload and recompute; never replay stale updates."""
+        identity = self._row_identity(original_row)
+        original_options = self.options
+        for attempt in range(max_attempts):
+            if attempt:
+                logger.warning('保存失败，重新加载最新数据并重跑（第 %s/%s 次）', attempt + 1, max_attempts)
+                try:
+                    loaded = self.excel_handler.load_data()
+                except Exception as exc:
+                    logger.error('重新加载发生异常: %s', exc)
+                    loaded = False
+                if not loaded:
+                    logger.error('重新加载失败，将继续有限重试')
+                    continue
+            current = self.excel_handler.get_row_data(row_index)
+            if attempt or current is None or self._row_identity(current) != identity:
+                frame = (self.excel_handler.google_handler.df if self.excel_handler.use_google_sheets
+                         else self.excel_handler.df)
+                matches = [index for index in frame.index
+                           if self._row_identity(self.excel_handler.get_row_data(index) or {}) == identity]
+                if len(matches) != 1:
+                    logger.error('职位来源已变化、消失或存在重复，无法安全定位原记录，未写回')
+                    return False, False
+                row_index = matches[0]
+            try:
+                if attempt:
+                    self.options = RunOptions(rows=(row_index + 2,), rerun='all',
+                        overwrite=original_options.overwrite, refresh_content=True, limit=1)
+                success = self._process_single_row(row_index)
+            finally:
+                self.options = original_options
+            try:
+                saved = self.excel_handler.save_data()
+            except Exception as exc:
+                logger.error('保存发生异常，将重新加载并重跑: %s', exc)
+                saved = False
+            if saved:
+                return success, True
+        return False, False
     
     def _cleanup_resources(self):
         """清理系统资源"""
@@ -214,8 +259,12 @@ class LLMAnalysisSystem:
             logger.info(f"获取内容: {url}")
             source = self._source_identity()
             content = None
+            source_is_document = False
             if self.options.rerun and not self.options.refresh_content:
-                content = self.run_store.get_content(source, url)
+                cached = self.run_store.get_content(source, url, with_metadata=True)
+                if cached is not None:
+                    content = cached['content']
+                    source_is_document = cached['is_document']
             if content is not None:
                 logger.info("行 %s 使用正文缓存；--refresh-content 可重新抓取", row_index)
                 fetch_summary = {}
@@ -223,7 +272,13 @@ class LLMAnalysisSystem:
                 content = self.content_fetcher.fetch_content(url)
                 fetch_summary = self.content_fetcher.get_last_fetch_summary()
                 if content:
-                    self.run_store.save_content(source, url, content)
+                    from .core.utils import is_pdf_url, is_google_docs_url
+                    source_is_document = bool(
+                        fetch_summary.get('selected_method') in ('pdf', 'google_docs', 'google_drive')
+                        or 'pdf' in (fetch_summary.get('content_type') or '').lower()
+                        or is_pdf_url(url) or is_google_docs_url(url)
+                        or ContentFetcher._is_canvas_pdf_viewer(url))
+                    self.run_store.save_content(source, url, content, is_document=source_is_document)
             if not content:
                 logger.error(f"抓取摘要: {fetch_summary}")
                 error_msg = "内容获取失败"
@@ -274,11 +329,14 @@ class LLMAnalysisSystem:
                                                    summary["executed"], self.options.overwrite)
             if 'stage3' in self.analysis_manager.last_run_summary['successful']:
                 # A rerun can retain old values; sanitize the actual merged row too.
-                _, additional = discard_overlong_labels(candidate_fields(row_data, results))
+                candidate = candidate_fields(row_data, results)
+                cleaned, additional = discard_overlong_labels(candidate)
+                for field in ('WX_Label1', 'WX_Label2', 'WX_Label3', 'WX_Label4', 'WX_Label5'):
+                    if cleaned[field] != candidate[field]:
+                        results[field] = cleaned[field]
+                        conflicts = [item for item in conflicts if item != field]
                 for warning in additional:
-                    results[warning['field']] = ''
                     self.analysis_manager.field_warnings.append(warning)
-                    conflicts = [field for field in conflicts if field != warning['field']]
             if conflicts:
                 retained = "保留已有字段: " + ", ".join(conflicts)
                 error_msg = f"{error_msg}; {retained}" if error_msg else retained
@@ -288,7 +346,8 @@ class LLMAnalysisSystem:
                 evidence = [item for items in self.analysis_manager.review_evidence.values() for item in items]
                 report = review_final_result(content, candidate_fields(row_data, results),
                     source_url=url, evidence=evidence, row_index=row_index,
-                    rejected_labels=self.analysis_manager.field_warnings)
+                    rejected_labels=self.analysis_manager.field_warnings,
+                    source_is_document=source_is_document)
                 self.run_store.save_review(source, row_index, url, report)
                 error_msg = review_error(report)
                 logger.info('最终审核: model=%s status=%s', report['model'], report['status'])

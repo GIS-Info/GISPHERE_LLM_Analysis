@@ -497,9 +497,13 @@ Snapshot 内容：
             contact_email, contact_name
         )
 
-        # 第一阶段已识别 Dr. 前缀且有邮箱 → 无需验证
+        from .final_review import field_quote_issue
+        # A generated Dr. prefix is not proof in itself. Search when the
+        # supplied posting does not actually support the title.
         if contact_name.startswith("Dr. ") and has_email and not email_needs_verification:
-            return False, "第一阶段已识别博士学位且有邮箱，无需验证"
+            if not field_quote_issue('Contact_Name', contact_name, original_text):
+                return False, "原文有博士或教授依据且已有邮箱，无需额外验证"
+            return True, "已有 Dr. 但原文缺少对应称谓依据，需要搜索个人页核实"
 
         if contact_name.startswith("Dr. ") and email_needs_verification:
             return True, "第一阶段邮箱疑似机构通用邮箱或与联系人不匹配，需要搜索个人邮箱"
@@ -725,7 +729,13 @@ Snapshot 内容：
             result['verification_details'] = explanation
             adopted = {field for field, old in (('Contact_Name', contact_name), ('Contact_Email', contact_email))
                        if result[field] != old}
-            # Only pages that support a field actually adopted in the final row.
+            from .final_review import field_quote_issue
+            if (title_prefix == 'Dr.' and contact_name.startswith('Dr. ')
+                    and field_quote_issue('Contact_Name', contact_name, original_text)):
+                # Corroborating an existing generated title is an adopted
+                # decision too; keep its page even when the string is unchanged.
+                adopted.add('Contact_Name')
+            # Only pages supporting adopted or corroborated fields reach review.
             self.last_review_evidence = [dict(item, decision_fields=[f for f in item['decision_fields'] if f in adopted])
                 for item in self.last_review_evidence if adopted.intersection(item['decision_fields'])]
             logger.info(f"验证完成: {result['Contact_Name']}, {result['Contact_Email']}")
@@ -1032,7 +1042,7 @@ Please carefully search for and extract the following information:
 
 Please return in JSON format:
 {{
-    "has_doctorate": true/false,
+    "has_doctorate": true/false/null,
     "title_prefix": "Dr./Mr./Ms.",
     "email_address": "found email address or null",
     "gender": "male/female/unknown",
@@ -1042,13 +1052,30 @@ Please return in JSON format:
 
 Important notes:
 - Set has_doctorate to true when confirmed PhD degree OR professor position
-- If uncertain, choose conservative title (Mr./Ms.)
+- Set has_doctorate to null when the page does not mention qualifications;
+  false is reserved for an explicit statement that the person has no doctorate.
+- Evidence must be an exact quote from this page, not an invented explanation.
+- When supporting a title, include both the person's name and the qualification
+  or explicit honorific in the quote; use ordered excerpts separated by " ... " if needed.
+- Use high confidence only for explicit evidence identifying this same person.
+- Confirm the same person and institutional affiliation before using a title or degree.
+- Use Dr. only with explicit doctorate or professor evidence for this person.
+- Use Mr./Ms. only when that honorific is explicitly stated for this person.
+- Do not infer Mr./Ms. from a name, photo, pronouns, gender or HR role.
+- If uncertain, set title_prefix to an empty string and preserve the clean name.
 - Email address must be in valid format (contain @)
 """
         try:
             response = self.llm_agent.call_llm(prompt)
             if response:
-                return self._parse_json_obj(response)
+                analysis = self._parse_json_obj(response)
+                if not isinstance(analysis, dict):
+                    return None
+                degree = analysis.get('has_doctorate')
+                if degree is not None and type(degree) is not bool:
+                    logger.warning('联系人学位判断类型无效，忽略该页面分析')
+                    return None
+                return analysis
         except Exception as e:
             logger.warning(f"LLM页面分析失败: {e}")
         return None
@@ -1058,33 +1085,42 @@ Important notes:
         """综合分析结果，确定最终联系人信息"""
         self.last_review_evidence = []
         if not analyzed_pages:
-            return "Mr./Ms.", "", "未找到相关页面信息"
+            return "", "", "未找到相关页面信息，称谓待核实"
 
         all_analyses = [p['analysis'] for p in analyzed_pages if p['analysis']]
         if not all_analyses:
-            return "Mr./Ms.", "", "页面分析失败"
+            return "", "", "页面分析失败，称谓待核实"
 
-        has_doctorate_count = sum(1 for a in all_analyses if a.get('has_doctorate', False))
+        from .final_review import quote_match, field_quote_issue
+        supported = []
+        for page in analyzed_pages:
+            analysis = page.get('analysis') or {}
+            text = (page.get('review_source') or {}).get('text', '')
+            quote = analysis.get('evidence')
+            if (analysis.get('confidence') == 'high' and isinstance(quote, str)
+                    and self._name_appears_relevant(text, contact_name)
+                    and quote_match(quote, [text])):
+                supported.append(page)
+        doctoral_pages = [p for p in supported if p['analysis'].get('has_doctorate') is True
+                          and not field_quote_issue('Contact_Name',
+                              'Dr. ' + self._clean_contact_name(contact_name), p['analysis']['evidence'])]
+        denied = any(p['analysis'].get('has_doctorate') is False for p in supported)
+        has_doctorate_count = len(doctoral_pages)
         emails = [
             clean_email_format(a.get('email_address'))
             for a in all_analyses
             if a.get('email_address')
             and not self._is_generic_or_mismatched_email(a.get('email_address'), contact_name)
         ]
-        genders = [a.get('gender') for a in all_analyses
-                   if a.get('gender') and a.get('gender') != 'unknown']
-
-        if has_doctorate_count > len(all_analyses) / 2:
+        if doctoral_pages and not denied:
             title_prefix = "Dr."
         else:
-            if genders:
-                counts: Dict[str, int] = {}
-                for g in genders:
-                    counts[g] = counts.get(g, 0) + 1
-                majority = max(counts, key=counts.get)
-                title_prefix = "Mr." if majority == "male" else ("Ms." if majority == "female" else "Mr./Ms.")
-            else:
-                title_prefix = "Mr./Ms."
+            # Gender alone is not evidence of a person's preferred honorific.
+            explicit_titles = {p['analysis'].get('title_prefix') for p in supported
+                               if p['analysis'].get('title_prefix') in ('Mr.', 'Ms.')
+                               and p['analysis']['title_prefix'] in p['analysis']['evidence']}
+            title_prefix = (next(iter(explicit_titles))
+                            if len(explicit_titles) == 1 and not doctoral_pages else "")
 
         best_email = emails[0] if emails else ""
 
@@ -1108,10 +1144,10 @@ Important notes:
                     remember(page, 'Contact_Email')
                     break
         # Keep a page the page-analysis model accepted as supporting the adopted title.
-        for page in analyzed_pages:
+        for page in supported:
             analysis = page.get('analysis') or {}
-            supports_title = (title_prefix == 'Dr.' and analysis.get('has_doctorate')) or (
-                title_prefix in ('Mr.', 'Ms.') and analysis.get('gender') == ('male' if title_prefix == 'Mr.' else 'female'))
+            supports_title = (title_prefix == 'Dr.' and analysis.get('has_doctorate') is True) or (
+                title_prefix in ('Mr.', 'Ms.') and analysis.get('title_prefix') == title_prefix)
             if supports_title:
                 remember(page, 'Contact_Name')
                 break

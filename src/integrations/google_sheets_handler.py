@@ -44,6 +44,8 @@ class GoogleSheetsHandler:
         self.service = None
         self.df = None
         self.original_df = None
+        self.original_formulas = None
+        self.last_save_error = ''
         self.sheet_id = None  # 用于批量操作
         self.google_http = None
         self.google_session = None
@@ -203,7 +205,7 @@ class GoogleSheetsHandler:
 
             logger.info("Google Sheets API服务初始化成功")
     
-    def fetch_data(self, range_name: str) -> List[List]:
+    def fetch_data(self, range_name: str, value_render_option='FORMATTED_VALUE') -> List[List]:
         """从Google表格获取数据"""
         self._initialize_service()
         
@@ -211,7 +213,8 @@ class GoogleSheetsHandler:
             sheet = self.service.spreadsheets()
             result = sheet.values().get(
                 spreadsheetId=self.spreadsheet_id, 
-                range=range_name
+                range=range_name,
+                valueRenderOption=value_render_option
             ).execute()
             
             values = result.get('values', [])
@@ -262,12 +265,15 @@ class GoogleSheetsHandler:
             # 将数据转换为DataFrame
             headers = data[0] if data else []
             rows = data[1:] if len(data) > 1 else []
+            formulas = self.fetch_data(range_name, 'FORMULA')
+            if not formulas or formulas[0] != headers:
+                raise ValueError('无法建立一致的表格公式基线，请重新加载')
+            self.original_formulas = formulas
             
             # 调整数据以匹配列数
             adjusted_rows = self.adjust_data_to_columns(rows, headers)
             
             self.df = pd.DataFrame(adjusted_rows, columns=headers)
-            self.original_df = self.df.copy()
             
             logger.info(f"成功加载Google表格数据")
             logger.info(f"数据行数: {len(self.df)}")
@@ -291,6 +297,7 @@ class GoogleSheetsHandler:
             for col in string_columns:
                 if col in self.df.columns:
                     self.df[col] = self.df[col].astype('object')
+            self.original_df = self.df.copy(deep=True)
             
             logger.info("已优化数据类型设置")
             return True
@@ -417,29 +424,95 @@ class GoogleSheetsHandler:
             return False
     
     def save_data(self) -> bool:
-        """保存数据到Google表格"""
+        """Preflight affected rows, then write only changed cells as RAW values.
+
+        This is optimistic conflict detection, not an atomic compare-and-swap.
+        A failed preflight never writes; conflicts require an explicit reload.
+        """
+        self.last_save_error = ''
         try:
-            if self.df is None:
-                logger.error("没有数据需要保存")
-                return False
-            
-            self._initialize_service()
-            
-            # 准备数据：包含标题行
+            if self.df is None or self.original_df is None or self.original_formulas is None:
+                raise ValueError('缺少表格原始快照，必须重新加载后保存')
+            if (not self.df.index.equals(self.original_df.index)
+                    or not self.df.columns.equals(self.original_df.columns)):
+                raise ValueError('不允许通过保存结果增删行或列，请重新加载表格')
             headers = self.df.columns.tolist()
-            data_rows = self.df.fillna('').values.tolist()  # 将NaN替换为空字符串
-            all_data = [headers] + data_rows
-            
-            # 更新整个工作表
-            range_name = f"{self.sheet_name}"
-            self.update_data_in_sheet(range_name, all_data)
-            
-            logger.info(f"数据已保存到Google表格: {self.spreadsheet_id}")
+            changes = [(row, col, self._cell_value(self.df.iat[row, col]))
+                       for row in range(len(self.df)) for col in range(len(headers))
+                       if self._cell_value(self.df.iat[row, col]) != self._cell_value(self.original_df.iat[row, col])]
+            if not changes:
+                return True
+            dirty_rows = sorted({row for row, _, _ in changes})
+            sheet = "'" + self.sheet_name.replace("'", "''") + "'"
+            last_col = self._column_name(len(headers) - 1)
+            ranges = [f'{sheet}!A1:{last_col}1'] + [
+                f'{sheet}!A{row + 2}:{last_col}{row + 2}' for row in dirty_rows]
+            self._initialize_service()
+            values_api = self.service.spreadsheets().values()
+            for render in ('FORMATTED_VALUE', 'FORMULA'):
+                snapshot = values_api.batchGet(spreadsheetId=self.spreadsheet_id,
+                    ranges=ranges, valueRenderOption=render).execute()
+                snapshots = snapshot.get('valueRanges', [])
+                if len(snapshots) != len(ranges):
+                    raise ValueError('远端快照不完整，停止保存')
+                if self._snapshot_row(snapshots[0], len(headers)) != headers:
+                    raise ValueError('远端表头已变化，停止保存，请重新加载')
+                for index, row in enumerate(dirty_rows, 1):
+                    if render == 'FORMATTED_VALUE':
+                        expected = [self._cell_value(v) for v in self.original_df.iloc[row].tolist()]
+                    else:
+                        expected = self._snapshot_row({'values': self.original_formulas[row + 1:row + 2]}, len(headers))
+                    if self._snapshot_row(snapshots[index], len(headers)) != expected:
+                        raise ValueError(f'远端第 {row + 2} 行已被修改，停止保存，请重新加载并重新审核')
+            data = [{'range': f'{sheet}!{self._column_name(col)}{row + 2}', 'values': [[value]]}
+                    for row, col, value in changes]
+            result = values_api.batchUpdate(spreadsheetId=self.spreadsheet_id, body={
+                'valueInputOption': 'RAW', 'data': data, 'includeValuesInResponse': True,
+                'responseValueRenderOption': 'UNFORMATTED_VALUE'}).execute()
+            responses = result.get('responses', [])
+            if len(responses) != len(changes):
+                raise ValueError('写回响应不完整，远端写入状态待核实，停止处理')
+            for response, (_, _, value) in zip(responses, changes):
+                if self._snapshot_row(response.get('updatedData', {}), 1) != [value]:
+                    raise ValueError('远端返回值与审核值不一致，停止处理并人工核实')
+            # Advance only the cells actually saved. Unrelated remote edits are
+            # neither overwritten nor silently adopted as our new baseline.
+            for row, col, value in changes:
+                self.original_df.iat[row, col] = value
+                while len(self.original_formulas) <= row + 1:
+                    self.original_formulas.append([])
+                formula_row = self.original_formulas[row + 1]
+                formula_row.extend([''] * (len(headers) - len(formula_row)))
+                formula_row[col] = value
+            logger.info('已按 RAW 保存 %s 个单元格，涉及 %s 行', len(changes), len(dirty_rows))
             return True
-            
         except Exception as e:
-            logger.error(f"保存数据失败: {e}")
+            self.last_save_error = str(e)
+            logger.error('保存数据失败: %s', e)
             return False
+
+    @staticmethod
+    def _cell_value(value):
+        if value is None or pd.isna(value):
+            return ''
+        return value.item() if hasattr(value, 'item') else value
+
+    @staticmethod
+    def _column_name(index):
+        name = ''
+        while index >= 0:
+            index, remainder = divmod(index, 26)
+            name = chr(65 + remainder) + name
+            index -= 1
+        return name
+
+    @classmethod
+    def _snapshot_row(cls, snapshot, width):
+        rows = snapshot.get('values', [])
+        row = rows[0] if rows else []
+        if len(row) > width:
+            raise ValueError('远端范围超出预期列数')
+        return [cls._cell_value(value) for value in row] + [''] * (width - len(row))
     
     def update_data_in_sheet(self, range_name: str, data: List[List]):
         """更新指定范围内的数据"""
@@ -451,7 +524,7 @@ class GoogleSheetsHandler:
             result = sheet.values().update(
                 spreadsheetId=self.spreadsheet_id,
                 range=range_name,
-                valueInputOption='USER_ENTERED',
+                valueInputOption='RAW',
                 body=body
             ).execute()
             
@@ -472,7 +545,7 @@ class GoogleSheetsHandler:
             result = sheet.values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range=range_name,
-                valueInputOption='USER_ENTERED',
+                valueInputOption='RAW',
                 body=body,
                 insertDataOption='INSERT_ROWS'
             ).execute()

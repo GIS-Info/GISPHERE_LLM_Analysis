@@ -91,16 +91,40 @@ class ValidationTests(OfflineTests):
         instance.llm_agent.analyze_text_stage3.return_value = dict(GOLD["stage3"], WX_Label1="Eng")
         self.assertFalse(instance._execute_stage3("offline")[0])
 
-    def test_overlong_labels_only_clear_the_offending_values(self):
+    def test_overlong_labels_are_removed_and_survivors_move_forward(self):
         raw = dict(GOLD['stage3'], WX_Label1='生成式人工智能', WX_Label2='空间数据基础设施', WX_Label3='深度强化学习')
         cleaned, warnings = discard_overlong_labels(raw)
-        self.assertEqual(cleaned['WX_Label1'], '')
+        self.assertEqual(cleaned['WX_Label1'], '深度强化学习')
         self.assertEqual(cleaned['WX_Label2'], '')
-        self.assertEqual(cleaned['WX_Label3'], '深度强化学习')
+        self.assertEqual(cleaned['WX_Label3'], '')
         self.assertEqual(cleaned['University_CN'], raw['University_CN'])
         self.assertEqual(raw['WX_Label1'], '生成式人工智能')
         self.assertEqual(len(warnings), 2)
         self.assertFalse(validation_errors(cleaned, 'stage3', allow_empty_label1=rejected_primary_label(warnings)))
+
+    def test_middle_label_removal_preserves_order_and_original_warning_position(self):
+        raw = dict(GOLD['stage3'], WX_Label1='生态学', WX_Label2='生物多样性监测', WX_Label3='深度学习')
+        cleaned, warnings = discard_overlong_labels(raw)
+        self.assertEqual([cleaned[f'WX_Label{i}'] for i in (1, 2, 3)], ['生态学', '深度学习', ''])
+        self.assertEqual(warnings[0]['field'], 'WX_Label2')
+        self.assertEqual(warnings[0]['value'], '生物多样性监测')
+        again, additional = discard_overlong_labels(cleaned)
+        self.assertEqual(again, cleaned)
+        self.assertEqual(additional, [])
+
+    def test_all_labels_rejected_preserves_empty_labels_and_rejection_history(self):
+        raw = dict(GOLD['stage3'], **{f'WX_Label{i}': '生物多样性监测' for i in (1, 2, 3)})
+        cleaned, warnings = discard_overlong_labels(raw)
+        self.assertEqual([cleaned[f'WX_Label{i}'] for i in (1, 2, 3)], ['', '', ''])
+        self.assertEqual(len(warnings), 3)
+        self.assertFalse(validation_errors(cleaned, 'stage3', allow_empty_label1=rejected_primary_label(warnings)))
+
+    def test_reserved_labels_and_invalid_fields_are_not_hidden_by_compaction(self):
+        raw = dict(GOLD['stage3'], WX_Label1='生物多样性监测', WX_Label2=123, WX_Label4='生态学')
+        cleaned, _ = discard_overlong_labels(raw)
+        self.assertEqual(cleaned['WX_Label2'], 123)
+        self.assertEqual(cleaned['WX_Label4'], '生态学')
+        self.assertTrue(validation_errors(cleaned, 'stage3'))
 
     def test_discarded_primary_does_not_fail_real_stage_or_orchestration(self):
         instance = manager()
@@ -108,7 +132,7 @@ class ValidationTests(OfflineTests):
         success, result, error = instance.analyze_text_complete('offline', 0)
         self.assertTrue(success)
         self.assertEqual(error, '')
-        self.assertEqual(result['WX_Label1'], '')
+        self.assertEqual(result['WX_Label1'], GOLD['stage3']['WX_Label2'])
         self.assertEqual(result['University_CN'], GOLD['stage3']['University_CN'])
         self.assertIn('stage3', instance.last_run_summary['successful'])
         self.assertEqual(instance.field_warnings[0]['value'], '生成式人工智能')
@@ -221,7 +245,7 @@ class StoreTests(unittest.TestCase):
     def test_discarded_label_checkpoint_requires_and_restores_rejection_record(self):
         result, warnings = discard_overlong_labels(dict(GOLD['stage3'], WX_Label1='生成式人工智能'))
         self.store.save_stage('source', 0, 'url', 'body', 'stage3', True, result, '', warnings=warnings)
-        self.assertEqual(self.store.load_stages('source', 0, 'url', 'body')['stage3']['WX_Label1'], '')
+        self.assertEqual(self.store.load_stages('source', 0, 'url', 'body')['stage3'], result)
         restored = self.store.load_stage_warnings('source', 0, 'url', 'body')
         self.assertEqual(restored['stage3'], warnings)
         instance = manager()
@@ -291,6 +315,83 @@ class WorkflowTests(OfflineTests):
         self.assertEqual(self.system.excel_handler.df.loc[0, "Error"], "")
         self.assertEqual(self.system.excel_handler.df.loc[0, "Verifier"], "LLM")
 
+    def test_cached_opaque_document_keeps_document_review_policy(self):
+        self.system.run_store.save_content(self.source, self.url, 'offline body', is_document=True)
+        self.assertTrue(self.system._process_single_row(0))
+        self.system.content_fetcher.fetch_content.assert_not_called()
+        self.assertIs(self.review.call_args.kwargs['source_is_document'], True)
+
+    def test_cached_web_policy_does_not_depend_on_previous_download_state(self):
+        self.system.content_fetcher.get_current_pdf_path.return_value = Path('previous-document.pdf')
+        self.assertTrue(self.system._process_single_row(0))
+        self.assertIs(self.review.call_args.kwargs['source_is_document'], False)
+
+    def test_fresh_web_policy_ignores_stale_download_state(self):
+        self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True, refresh_content=True)
+        self.system.content_fetcher.get_current_pdf_path.return_value = Path('stale-document.pdf')
+        self.assertTrue(self.system._process_single_row(0))
+        self.assertIs(self.review.call_args.kwargs['source_is_document'], False)
+
+    def test_fresh_content_type_document_metadata_is_cached_and_used(self):
+        self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True, refresh_content=True)
+        self.system.content_fetcher.get_last_fetch_summary.return_value = {
+            'selected_method': 'pdf', 'content_type': 'application/pdf'}
+        self.assertTrue(self.system._process_single_row(0))
+        self.assertIs(self.review.call_args.kwargs['source_is_document'], True)
+        self.assertIs(self.system.run_store.get_content(self.source, self.url, with_metadata=True)['is_document'], True)
+
+    def test_run_reloads_and_retries_save_failures_with_a_finite_limit(self):
+        self.system.initialize = MagicMock(return_value=True)
+        self.system._process_single_row = MagicMock(return_value=True)
+        self.system.excel_handler.save_data = MagicMock(return_value=False)
+        self.system.excel_handler.load_data = MagicMock(return_value=True)
+        self.system._cleanup_resources = MagicMock()
+        self.system.processed_count = self.system.success_count = self.system.error_count = 0
+        self.assertFalse(self.system.run(RunOptions(rerun='failed')))
+        self.assertEqual(self.system.excel_handler.save_data.call_count, 3)
+        self.assertEqual(self.system.excel_handler.load_data.call_count, 2)
+        self.assertEqual(self.system._process_single_row.call_count, 3)
+        self.system._cleanup_resources.assert_called_once()
+
+    def test_save_retry_uses_latest_row_refreshes_content_and_reanalyzes(self):
+        original = self.system.excel_handler.get_row_data(0)
+        options = self.system.options
+        calls = []
+        def process(index):
+            calls.append((index, self.system.options, self.system.excel_handler.get_row_data(index)['Direction']))
+            return True
+        def reload():
+            self.system.excel_handler.df.loc[0, 'Direction'] = 'Latest human edit'
+            return True
+        self.system._process_single_row = MagicMock(side_effect=process)
+        self.system.excel_handler.load_data = MagicMock(side_effect=reload)
+        self.system.excel_handler.save_data = MagicMock(side_effect=[False, True])
+        self.assertEqual(self.system._process_and_save_row(0, original), (True, True))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][2], 'Latest human edit')
+        self.assertEqual(calls[1][1].rerun, 'all')
+        self.assertTrue(calls[1][1].refresh_content)
+        self.assertFalse(calls[1][1].overwrite)
+        self.assertIs(self.system.options, options)
+
+    def test_save_retry_relocates_a_moved_job_and_does_not_follow_a_replaced_source(self):
+        original = self.system.excel_handler.get_row_data(0)
+        self.system._process_single_row = MagicMock(return_value=True)
+        self.system.excel_handler.save_data = MagicMock(side_effect=[False, True])
+        def reload():
+            moved = self.system.excel_handler.df.loc[0].copy()
+            self.system.excel_handler.df.loc[0, 'Source'] = 'https://example.invalid/other'
+            self.system.excel_handler.df.loc[1] = moved
+            return True
+        self.system.excel_handler.load_data = MagicMock(side_effect=reload)
+        self.assertEqual(self.system._process_and_save_row(0, original), (True, True))
+        self.assertEqual([call.args[0] for call in self.system._process_single_row.call_args_list], [0, 1])
+        self.system._process_single_row.reset_mock()
+        self.system.excel_handler.save_data = MagicMock(return_value=False)
+        replaced = dict(original, Source='https://example.invalid/deleted')
+        self.assertEqual(self.system._process_and_save_row(0, replaced), (False, False))
+        self.system._process_single_row.assert_not_called()
+
     def test_preserved_human_edit_does_not_get_marked_fully_verified(self):
         self.system.excel_handler.df.loc[0, "University_EN"] = "Human reviewed"
         self.assertTrue(self.system._process_single_row(0))
@@ -352,21 +453,24 @@ class WorkflowTests(OfflineTests):
             GOLD['stage3'], WX_Label1='生成式人工智能', WX_Label2='空间数据基础设施')
         self.assertTrue(self.system._process_single_row(0))
         row = self.system.excel_handler.df.loc[0]
-        self.assertEqual(row['WX_Label1'], '')
+        self.assertEqual(row['WX_Label1'], GOLD['stage3']['WX_Label3'])
         self.assertEqual(row['WX_Label2'], '')
         self.assertEqual(row['University_CN'], GOLD['stage3']['University_CN'])
         self.assertEqual(row['Verifier'], 'LLM')
         self.assertIn('超长标签已舍弃', row['Error'])
         self.review.assert_called_once()
-        self.assertEqual(self.review.call_args.args[1]['WX_Label1'], '')
+        self.assertEqual(self.review.call_args.args[1]['WX_Label1'], GOLD['stage3']['WX_Label3'])
         self.assertEqual(len(self.review.call_args.kwargs['rejected_labels']), 2)
 
     def test_preserved_old_overlong_value_is_also_removed_before_review(self):
         self.system.excel_handler.df.loc[0, 'WX_Label2'] = '生成式人工智能'
         self.assertTrue(self.system._process_single_row(0))
-        self.assertEqual(self.system.excel_handler.df.loc[0, 'WX_Label2'], '')
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'WX_Label2'], GOLD['stage3']['WX_Label3'])
+        self.assertEqual(self.system.excel_handler.df.loc[0, 'WX_Label3'], '')
         self.assertEqual(self.system.excel_handler.df.loc[0, 'Verifier'], 'LLM')
         self.review.assert_called_once()
+        self.assertEqual(self.review.call_args.args[1]['WX_Label2'], GOLD['stage3']['WX_Label3'])
+        self.assertEqual(self.review.call_args.args[1]['WX_Label3'], '')
 
     def test_rejected_label_does_not_override_review_failure(self):
         self.system.options = RunOptions(rows=(2,), rerun='all', overwrite=True)
@@ -376,7 +480,8 @@ class WorkflowTests(OfflineTests):
         self.assertTrue(self.system._process_single_row(0))
         row = self.system.excel_handler.df.loc[0]
         self.assertEqual(row['Verifier'], '')
-        self.assertEqual(row['WX_Label2'], '')
+        self.assertEqual(row['WX_Label2'], GOLD['stage3']['WX_Label3'])
+        self.assertEqual(row['WX_Label3'], '')
         self.assertIn('超长标签已舍弃', row['Error'])
         self.assertIn('审核未完成', row['Error'])
 
