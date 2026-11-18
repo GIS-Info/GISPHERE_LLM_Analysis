@@ -236,7 +236,10 @@ def validate_review(data, source_text, evidence, fields=None):
 
 def review_final_result(text, fields, *, source_url='', evidence=None, row_index=None, client=None,
                         rejected_labels=None, original_page=None, source_is_document=False):
-    """One request, no fallback, correction, retry or partial-source review."""
+    """One review, no model fallback, correction or partial-source review.
+
+    The HTTP layer may reconnect after a transient TLS EOF failure.
+    """
     evidence = list(evidence or [])
     if original_page is None and source_url:
         from ..ingestion.review_source import collect_review_source

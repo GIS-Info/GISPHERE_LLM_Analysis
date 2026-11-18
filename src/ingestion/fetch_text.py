@@ -2,7 +2,6 @@
 网页和PDF内容提取模块
 """
 import requests
-import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
 import logging
 from pathlib import Path

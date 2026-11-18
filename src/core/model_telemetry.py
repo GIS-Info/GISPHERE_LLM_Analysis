@@ -1,5 +1,6 @@
-"""Instrument model HTTP calls without changing routing or retry behavior."""
+"""Instrument model HTTP calls with bounded recovery from TLS EOF failures."""
 import logging
+import time
 import requests
 
 from .observability import observation, record_http_error, record_model_response
@@ -7,12 +8,33 @@ from .observability import observation, record_http_error, record_model_response
 logger = logging.getLogger(__name__)
 
 
+def _post_with_tls_recovery(url, *, headers, body, timeout):
+    """Retry only an abruptly closed TLS connection, never certificate failures.
+
+    A lost response can mean the provider already processed the POST. Keep the
+    retry budget small; every attempt uses the same model and request body.
+    requests.post creates a fresh session/connection on each attempt.
+    """
+    for attempt in range(3):
+        try:
+            return requests.post(url, headers=headers, json=body, timeout=timeout)
+        except requests.exceptions.SSLError as exc:
+            detail = str(exc).lower()
+            tls_eof = ('unexpected_eof_while_reading' in detail
+                       or 'eof occurred in violation of protocol' in detail)
+            if not tls_eof or 'certificate_verify_failed' in detail or attempt == 2:
+                raise
+            delay = 2 ** attempt
+            logger.warning('模型 HTTPS 连接意外关闭，%s 秒后重连（%s/2）', delay, attempt + 1)
+            time.sleep(delay)
+
+
 def model_post(*, name, url, body, headers, timeout, extract_text, protocol="openai",
                model=None, input=None, parameters=None, require_text=False):
     with observation(name, as_type="generation", model=model or body.get("model"),
                      input=input, model_parameters=parameters or {},
                      metadata={"protocol": protocol}) as generation:
-        response = requests.post(url, headers=headers, json=body, timeout=timeout)
+        response = _post_with_tls_recovery(url, headers=headers, body=body, timeout=timeout)
         if not response.ok:
             record_http_error(generation, response)
             return response, None

@@ -202,11 +202,11 @@ Extract the text now:"""
             return None
         
         try:
-            import fitz  # PyMuPDF
+            import pymupdf
             
             logger.info(f"Converting PDF to images for Document AI: {pdf_path.name}")
             
-            doc = fitz.open(pdf_path)
+            doc = pymupdf.open(pdf_path)
             total_pages = len(doc)
             pages_to_process = min(total_pages, DOCUMENT_AI_MAX_PAGES)
             
@@ -219,7 +219,7 @@ Extract the text now:"""
                     page = doc.load_page(page_num)
                     
                     # 转换为图片 (使用2倍分辨率提高清晰度)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
                     img_data = pix.tobytes("png")
 
                     logger.info(f"Processing PDF page {page_num + 1}/{pages_to_process}")
@@ -255,7 +255,7 @@ Extract the text now:"""
                 return None
                 
         except ImportError:
-            logger.error("PyMuPDF (fitz) not installed, cannot process PDF")
+            logger.error("PyMuPDF (pymupdf) not installed, cannot process PDF")
             return None
         except Exception as e:
             logger.error(f"Document AI PDF extraction failed: {e}")

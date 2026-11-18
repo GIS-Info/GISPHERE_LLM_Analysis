@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import fitz  # PyMuPDF
+import pymupdf
 
 from ..core.config import USE_DOCUMENT_AI  # noqa: F401  (保留以表明依赖配置开关)
 from . import text_quality
@@ -72,7 +72,7 @@ def extract_with_pymupdf4llm(pdf_path: Path) -> Optional[str]:
 def extract_with_pymupdf(pdf_path: Path) -> Optional[str]:
     """使用PyMuPDF提取文本"""
     try:
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         text_content = []
 
         for page_num in range(len(doc)):
@@ -162,7 +162,7 @@ def extract_with_ocr(pdf_path: Path) -> Optional[str]:
 
         logger.info("开始OCR处理，这可能需要一些时间...")
 
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         text_content = []
 
         # 只处理前10页，避免OCR时间过长
@@ -172,7 +172,7 @@ def extract_with_ocr(pdf_path: Path) -> Optional[str]:
             try:
                 page = doc.load_page(page_num)
 
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 提高分辨率
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))  # 提高分辨率
                 img_data = pix.tobytes("ppm")
 
                 img = Image.open(io.BytesIO(img_data))

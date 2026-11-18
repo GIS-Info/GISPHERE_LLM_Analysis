@@ -22,7 +22,7 @@ def check_dependencies():
         'numpy': 'numpy',
         'openpyxl': 'openpyxl',
         'beautifulsoup4': 'bs4',
-        'PyMuPDF': 'fitz',
+        'PyMuPDF': 'pymupdf',
         'pymupdf4llm': 'pymupdf4llm',
         'pdfplumber': 'pdfplumber',
         'pytesseract': 'pytesseract',
